@@ -346,6 +346,22 @@ Pesan AUTH_OK:
 N byte   newToken                hanya saat pairing sukses
 ```
 
+Pesan AUTH_DENIED:
+
+```
+1 byte   reason               0x01 bad-credential | 0x02 expired-code | 0x03 device-limit
+1 byte   messageLength        0–255 (0 = tanpa pesan)
+N byte   message              UTF-8, bebas debug (TIDAK boleh berisi token/kode)
+```
+
+Aturan AUTH_DENIED:
+
+- `reason` tidak dikenal → pesan ditolak (ERROR `invalid-message` + tutup).
+- `messageLength` boleh 0 (pesan kosong).
+- Payload truncated, UTF-8 tidak valid, atau byte tambahan setelah `message`
+  → pesan ditolak. Tidak ada field lain selain `reason`, `messageLength`,
+  dan `message`.
+
 Client wajib menyimpan `newToken` dengan aman (mis. Android Keystore).
 Server menyimpan token ter-hash (bukan plaintext).
 
@@ -668,6 +684,17 @@ payload = 1+36+8+1+1+2+19 = 68 byte → `PayloadLength = 0x0044`.
 Binding memakai **nama logis**, bukan kode API Windows, contoh:
 `{"schemaVersion":1,"bindings":{"btn-fire":{"type":"keyboard","key":"Space"}}}`.
 Resolusi `key → VirtualKeyCode` murni tanggung jawab desktop.
+
+### 19.13 AUTH_DENIED (S→C)
+Payload: reason=0x01 (bad-credential), message `"auth failed"` (11 byte).
+Panjang payload = 1 + 1 + 11 = 13 (0x0D).
+
+```
+43 54 01 00 08 05 00 0D 00 02 00 00 01 8D 9E 8E 2A 00
+01                               reason bad-credential
+0B                               messageLength 11
+61 75 74 68 20 66 61 69 6C 65 64 "auth failed"
+```
 
 ## 20. Batas ukuran message
 
