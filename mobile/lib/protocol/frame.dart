@@ -61,6 +61,11 @@ class FrameCodec {
   static const int mustUnderstand = 0x08;
   static const int _allowedFlags = ackRequested | mustUnderstand;
 
+  /// Flags reserved for future versions (SECURE, COMPRESSED and the top four
+  /// bits). decode must NOT reject them (D2): the session layer answers with
+  /// ERROR forbidden + close. encode keeps rejecting them defensively.
+  static const int reservedFlagsMask = 0xF6;
+
   static Uint8List encode(ProtocolFrame frame) {
     _validate(frame);
 
@@ -89,11 +94,6 @@ class FrameCodec {
     }
 
     final flags = data.getUint8(4);
-    if ((flags & ~_allowedFlags) != 0) {
-      throw const ProtocolException(
-        'Reserved frame flags must be zero in v1.',
-      );
-    }
 
     final payloadLength = data.getUint16(6, Endian.big);
     final expectedLength = ProtocolFrame.headerSize + payloadLength;

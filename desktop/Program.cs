@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using CTRL.Desktop.Protocol;
+using CTRL.Desktop.Session;
 using CTRL.Desktop.Transport;
 
 RunFrameCodecSmokeTests();
@@ -21,8 +22,23 @@ RunInputSnapshotCodecSmokeTests();
 RunInputResetCodecSmokeTests();
 RunFrameBufferSmokeTests();
 await RunLoopbackTransportSmokeTests();
+RunSequenceTrackerSmokeTests();
+RunAckTrackerSmokeTests();
+RunSessionHandshakeSmokeTests();
+RunSessionForbiddenFlagSmokeTests();
+RunSessionNotAuthenticatedSmokeTests();
+RunSessionInvalidMessageSmokeTests();
+RunSessionUnsupportedMessageSmokeTests();
+RunSessionWrongDirectionSmokeTests();
+RunSessionInputDropSmokeTests();
+RunSessionPongSmokeTests();
+RunSessionAckSmokeTests();
+RunSessionAuthDeniedSmokeTests();
+RunSessionTakeoverSmokeTests();
+await RunSessionLoopbackHostSmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
+Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
 
 static void RunFrameCodecSmokeTests()
 {
@@ -54,7 +70,14 @@ static void RunFrameCodecSmokeTests()
 
     ExpectProtocolException(() => FrameCodec.Decode(encoded[..^1]), "truncated frame");
     ExpectProtocolException(() => FrameCodec.Decode([0x00, 0x00, ..encoded[2..]]), "invalid magic");
-    ExpectProtocolException(() => FrameCodec.Decode([..encoded[..4], 0x02, ..encoded[5..]]), "reserved flag");
+
+    // D2: Decode must NOT reject reserved flags (the session layer answers with
+    // ERROR forbidden + close); Encode must still reject them defensively.
+    var reserved = FrameCodec.Decode([..encoded[..4], 0x02, ..encoded[5..]]);
+    if ((reserved.Flags & FrameCodec.ReservedFlagsMask) == 0)
+        throw new Exception("Decode must preserve reserved flags (D2).");
+    ExpectProtocolException(
+        () => FrameCodec.Encode(frame with { Flags = FrameCodec.ReservedFlagsMask }), "reserved flag (encode)");
 }
 
 static void RunPayloadPrimitiveSmokeTests()
@@ -963,6 +986,384 @@ static async Task RunLoopbackTransportSmokeTests()
     Console.WriteLine("M1.3: loopback transport smoke tests passed.");
 }
 
+static void RunSequenceTrackerSmokeTests()
+{
+    var outbound = new SequenceTracker();
+    Assert(outbound.Next() == 0 && outbound.Next() == 1 && outbound.Next() == 2,
+        "outbound sequence must be continuous from 0");
+
+    var inbound = new InboundSequenceTracker();
+    Assert(inbound.IsMonotonic(0), "first inbound sequence must be accepted");
+    Assert(inbound.IsMonotonic(1), "increment must be accepted");
+    Assert(inbound.IsMonotonic(2), "increment must be accepted");
+    Assert(!inbound.IsMonotonic(2), "duplicate sequence must be rejected");
+    Assert(!inbound.IsMonotonic(0), "regression must be rejected");
+    Assert(!inbound.IsMonotonic(40000), "forward jump over 0x7FFF must be rejected");
+    Assert(inbound.IsMonotonic(40001), "forward jump within 0x7FFF must be accepted");
+
+    var wrap = new InboundSequenceTracker();
+    for (ushort i = 0; i < 3; i++)
+        Assert(wrap.IsMonotonic(i), "wrapped increment must be accepted");
+
+    Console.WriteLine("M1.4.2: sequence tracker smoke tests passed.");
+}
+
+static void RunAckTrackerSmokeTests()
+{
+    ulong now = 0;
+    var tracker = new AckTracker(() => now, 3000);
+    tracker.Track(10);
+    Assert(tracker.PendingCount == 1, "pending count after track");
+    now = 2999;
+    Assert(tracker.RetryExpired().Count == 0, "no retry before timeout");
+    now = 3000;
+    var retry = tracker.RetryExpired();
+    Assert(retry.Count == 1 && retry[0] == 10, "retry after first timeout");
+    Assert(tracker.RetryExpired().Count == 0, "retry exactly once");
+    now = 6000;
+    var failed = tracker.Failed();
+    Assert(failed.Count == 1 && failed[0] == 10, "failed after retry timeout");
+
+    now = 0;
+    var tracker2 = new AckTracker(() => now, 3000);
+    tracker2.Track(20);
+    tracker2.Acknowledge(20);
+    Assert(tracker2.PendingCount == 0 && !tracker2.IsPending(20), "ack must clear pending state");
+
+    Console.WriteLine("M1.4.2: ack tracker smoke tests passed.");
+}
+
+static void RunSessionHandshakeSmokeTests()
+{
+    var (session, conn, listener, flusher) = CreateSession();
+    Assert(session.State == ServerSessionState.WaitHello, "initial state must be WaitHello");
+
+    conn.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+
+    Assert(session.State == ServerSessionState.WaitAuth, "state must advance to WaitAuth");
+    Assert(conn.SentFrames.Count == 1, "server must send WELCOME");
+    Assert(conn.SentFrames[0].MessageType == MessageType.Welcome, "first outbound must be WELCOME");
+    Assert(conn.SentFrames[0].Sequence == 0, "WELCOME sequence must be 0 (D1)");
+    var welcome = WelcomePayloadCodec.Decode(conn.SentFrames[0].Payload);
+    Assert(welcome.AuthRequired, "authRequired must be true (D6)");
+    Assert(welcome.SessionId.SequenceEqual(TestData.SessionId), "sessionId must be server-issued");
+    Assert(welcome.Challenge.SequenceEqual(TestData.Challenge), "challenge must be server-issued");
+
+    conn.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", welcome.Challenge)),
+        1, mustUnderstand: true));
+
+    Assert(session.State == ServerSessionState.Ready, "state must advance to Ready");
+    Assert(conn.SentFrames.Count == 2, "server must send AUTH_OK");
+    Assert(conn.SentFrames[1].MessageType == MessageType.AuthOk, "second outbound must be AUTH_OK");
+    Assert(conn.SentFrames[1].Sequence == 1, "AUTH_OK sequence must be 1 (D1 continuous)");
+    var authOk = AuthOkPayloadCodec.Decode(conn.SentFrames[1].Payload);
+    Assert(authOk.SessionId.SequenceEqual(welcome.SessionId), "AUTH_OK must echo sessionId");
+    Assert(authOk.NewToken.Length == 0, "token auth must not issue a newToken");
+
+    Console.WriteLine("M1.4.2: session handshake smoke tests passed.");
+}
+
+static void RunSessionForbiddenFlagSmokeTests()
+{
+    var (session, conn, listener, flusher) = CreateSession();
+    var raw = MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true);
+    raw[4] = 0x02; // reserved flag SECURE — Encode refuses it, so patch raw bytes directly.
+    conn.Emit(raw);
+
+    Assert(conn.SentFrames.Count == 1 && conn.SentFrames[0].MessageType == MessageType.Error,
+        "reserved flags must produce ERROR");
+    var error = ErrorPayloadCodec.Decode(conn.SentFrames[0].Payload);
+    Assert(error.Code == ErrorPayloadCodec.CodeForbidden, "reserved flags must map to ERROR forbidden (D2)");
+    Assert(session.State == ServerSessionState.Closed, "session must close after forbidden flags");
+    Assert(flusher.FlushCount == 1, "flush must run on close");
+
+    Console.WriteLine("M1.4.2: session forbidden-flag smoke tests passed.");
+}
+
+static void RunSessionNotAuthenticatedSmokeTests()
+{
+    var (session, conn, listener, flusher) = CreateSession();
+    conn.Emit(MakeFrame(MessageType.InputEvent,
+        InputEventPayloadCodec.Encode(new InputEventPayload(new InputEvent("a", 0, 0, State: 1, PressCount: 1))),
+        0));
+
+    Assert(conn.SentFrames.Count == 1 && conn.SentFrames[0].MessageType == MessageType.Error,
+        "input before auth must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(conn.SentFrames[0].Payload).Code == ErrorPayloadCodec.CodeNotAuthenticated,
+        "must be ERROR not-authenticated");
+    Assert(session.State == ServerSessionState.Closed, "session must close after not-authenticated");
+
+    Console.WriteLine("M1.4.2: session not-authenticated smoke tests passed.");
+}
+
+static void RunSessionInvalidMessageSmokeTests()
+{
+    // AUTH before HELLO (out of state).
+    var (s1, c1, l1, f1) = CreateSession();
+    c1.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", new byte[32])),
+        0, mustUnderstand: true));
+    Assert(c1.SentFrames.Count == 1 && c1.SentFrames[0].MessageType == MessageType.Error,
+        "out-of-state AUTH must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(c1.SentFrames[0].Payload).Code == ErrorPayloadCodec.CodeInvalidMessage,
+        "out-of-state AUTH must be ERROR invalid-message (D5)");
+
+    // Malformed control payload (HELLO truncated).
+    var (s2, c2, l2, f2) = CreateSession();
+    c2.Emit(MakeFrame(MessageType.Hello, new byte[] { 0x05 }, 0, mustUnderstand: true));
+    Assert(c2.SentFrames.Count == 1 && c2.SentFrames[0].MessageType == MessageType.Error,
+        "malformed HELLO must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(c2.SentFrames[0].Payload).Code == ErrorPayloadCodec.CodeInvalidMessage,
+        "malformed control payload must be ERROR invalid-message");
+
+    Console.WriteLine("M1.4.2: session invalid-message smoke tests passed.");
+}
+
+static void RunSessionUnsupportedMessageSmokeTests()
+{
+    var (s1, c1, l1, f1) = CreateSession();
+    c1.Emit(MakeFrame(0x0E, new byte[] { 0x00 }, 0, mustUnderstand: true));
+    Assert(c1.SentFrames.Count == 1 && c1.SentFrames[0].MessageType == MessageType.Error,
+        "wajib-dipahami unknown type must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(c1.SentFrames[0].Payload).Code == ErrorPayloadCodec.CodeUnsupportedMessage,
+        "wajib-dipahami unknown type must be ERROR unsupported-message");
+
+    var (s2, c2, l2, f2) = CreateSession();
+    c2.Emit(MakeFrame(0x20, new byte[] { 0x00 }, 0));
+    Assert(c2.SentFrames.Count == 0, "non-wajib unknown type must be ignored");
+    Assert(s2.State == ServerSessionState.WaitHello, "ignored message must not close the session");
+
+    Console.WriteLine("M1.4.2: session unsupported-message smoke tests passed.");
+}
+
+static void RunSessionWrongDirectionSmokeTests()
+{
+    var (s1, c1, l1, f1) = CreateSession();
+    c1.Emit(MakeFrame(MessageType.Welcome, new byte[16], 0, mustUnderstand: true));
+    Assert(c1.SentFrames.Count == 1 && c1.SentFrames[0].MessageType == MessageType.Error,
+        "client WELCOME must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(c1.SentFrames[0].Payload).Code == ErrorPayloadCodec.CodeInvalidMessage,
+        "wrong-direction known type must be ERROR invalid-message");
+
+    var (s2, c2, l2, f2) = CreateSession();
+    c2.Emit(MakeFrame(MessageType.Pong, new byte[16], 0));
+    Assert(c2.SentFrames.Count == 1 && c2.SentFrames[0].MessageType == MessageType.Error,
+        "client PONG must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(c2.SentFrames[0].Payload).Code == ErrorPayloadCodec.CodeInvalidMessage,
+        "client PONG must be ERROR invalid-message");
+
+    Console.WriteLine("M1.4.2: session wrong-direction smoke tests passed.");
+}
+
+static void RunSessionInputDropSmokeTests()
+{
+    var (session, conn, listener, flusher) = HandshakeToReady();
+    var sentBefore = conn.SentFrames.Count;
+
+    // Truncated button event: missing pressCount.
+    conn.Emit(MakeFrame(MessageType.InputEvent, new byte[] { 0x01, 0x61, 0x00, 0x00, 0x01 }, 2));
+    Assert(conn.SentFrames.Count == sentBefore, "malformed input must not produce ERROR");
+    Assert(listener.InputEvents.Count == 0, "malformed input must not be delivered");
+    Assert(listener.Errors.Any(e => e.Contains("Dropped malformed INPUT_EVENT")), "malformed input must be logged");
+    Assert(session.State == ServerSessionState.Ready, "malformed input must not close the session");
+
+    var valid = new InputEvent("btn-fire", InputEventCodec.KindButton, InputEventCodec.FlagStateChanged,
+        State: InputEventCodec.StateDown, PressCount: 3);
+    conn.Emit(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(new InputEventPayload(valid)), 3));
+    Assert(listener.InputEvents.Count == 1 && listener.InputEvents[0] == valid, "valid input event must be delivered");
+
+    var snapshot = new InputSnapshotPayload(new List<InputEvent> { valid });
+    conn.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(snapshot), 4));
+    Assert(listener.Snapshots.Count == 1 && listener.Snapshots[0].Events.Count == 1,
+        "valid input snapshot must be delivered");
+
+    Console.WriteLine("M1.4.2: session input drop smoke tests passed.");
+}
+
+static void RunSessionPongSmokeTests()
+{
+    var (session, conn, listener, flusher) = HandshakeToReady(now: 5000);
+    conn.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(42)), 2));
+
+    Assert(conn.SentFrames[^1].MessageType == MessageType.Pong, "server must reply PONG to HEARTBEAT (D7)");
+    var pong = PongPayloadCodec.Decode(conn.SentFrames[^1].Payload);
+    Assert(pong.ClientSendTime == 42 && pong.ServerTime == 5000, "PONG must echo client send time and carry server time");
+
+    Console.WriteLine("M1.4.2: session PONG smoke tests passed.");
+}
+
+static void RunSessionAckSmokeTests()
+{
+    var (session, conn, listener, flusher) = HandshakeToReady(now: 1000);
+    var input = new InputEvent("a", 0, 0, State: 1, PressCount: 1);
+    conn.Emit(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(new InputEventPayload(input)), 7, ackRequested: true));
+
+    Assert(conn.SentFrames[^1].MessageType == MessageType.Ack, "ACK_REQUESTED must produce ACK");
+    var ack = AckPayloadCodec.Decode(conn.SentFrames[^1].Payload);
+    Assert(ack.AckedSequence == 7 && ack.AckTime == 1000, "ACK must echo sequence and carry server time");
+
+    Console.WriteLine("M1.4.2: session ACK smoke tests passed.");
+}
+
+static void RunSessionAuthDeniedSmokeTests()
+{
+    var (s1, c1, l1, f1) = CreateSession();
+    c1.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var welcome1 = WelcomePayloadCodec.Decode(c1.SentFrames[0].Payload);
+
+    c1.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x02, "wrong", "ctrl-42a8", welcome1.Challenge)),
+        1, mustUnderstand: true));
+    Assert(c1.SentFrames[^1].MessageType == MessageType.AuthDenied, "bad credential must produce AUTH_DENIED");
+    Assert(s1.State == ServerSessionState.Closed, "session must close after AUTH_DENIED");
+    var denied = AuthDeniedPayloadCodec.Decode(c1.SentFrames[^1].Payload);
+    Assert(denied.Reason == AuthDeniedPayloadCodec.ReasonBadCredential, "AUTH_DENIED reason must be bad-credential");
+
+    var (s2, c2, l2, f2) = CreateSession();
+    c2.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var welcome2 = WelcomePayloadCodec.Decode(c2.SentFrames[0].Payload);
+
+    c2.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x02, "123456", "ctrl-42a8", welcome2.Challenge)),
+        1, mustUnderstand: true));
+    Assert(s2.State == ServerSessionState.Ready, "pairing-code auth must succeed");
+    var ok = AuthOkPayloadCodec.Decode(c2.SentFrames[^1].Payload);
+    Assert(ok.NewToken.Length == 16, "pairing-code auth must issue a 16-byte token");
+
+    Console.WriteLine("M1.4.2: session auth-denied smoke tests passed.");
+}
+
+static void RunSessionTakeoverSmokeTests()
+{
+    var manager = new SessionManager();
+
+    var (s1, c1, l1, f1) = CreateSession();
+    manager.Register(s1);
+    c1.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var w1 = WelcomePayloadCodec.Decode(c1.SentFrames[0].Payload);
+    c1.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", w1.Challenge)),
+        1, mustUnderstand: true));
+    Assert(manager.ActiveCount == 1, "first session must be active");
+
+    var (s2, c2, l2, f2) = CreateSession();
+    manager.Register(s2);
+    c2.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var w2 = WelcomePayloadCodec.Decode(c2.SentFrames[0].Payload);
+    c2.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", w2.Challenge)),
+        1, mustUnderstand: true));
+
+    Assert(manager.ActiveCount == 1, "second session must replace the first");
+    Assert(manager.IsActive("ctrl-42a8"), "device must remain active");
+    Assert(s2.State == ServerSessionState.Ready, "new session must be Ready");
+    Assert(s1.State == ServerSessionState.Closed, "old session must be closed (D3)");
+    Assert(f1.FlushCount == 1, "old session must flush pending inputs (D3)");
+    var last = c1.SentFrames[^1];
+    Assert(last.MessageType == MessageType.Error, "old session must receive ERROR");
+    Assert(ErrorPayloadCodec.Decode(last.Payload).Code == ErrorPayloadCodec.CodeDeviceLimit,
+        "old session must receive ERROR device-limit (D3)");
+
+    Console.WriteLine("M1.4.2: session takeover smoke tests passed.");
+}
+
+static async Task RunSessionLoopbackHostSmokeTests()
+{
+    var server = new TcpServer(0);
+    var host = new SessionHost(server, new AuthenticatorStub(["ctrl-42a8"]), new RecordingSessionListener());
+    var accepted = new ConcurrentQueue<Session>();
+    host.SessionAccepted += s => accepted.Enqueue(s);
+    _ = host.StartAsync();
+    await WaitUntil(() => host.IsListening);
+
+    var client = new TcpClient();
+    await client.ConnectAsync(IPAddress.Loopback, server.LocalPort);
+    var transport = new TcpConnection(client);
+    var frames = new ConcurrentQueue<ProtocolFrame>();
+    transport.FrameReceived += f => frames.Enqueue(f);
+    var run = transport.RunAsync();
+
+    await transport.SendAsync(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    await WaitUntil(() => frames.Count == 1);
+    Assert(frames.First().MessageType == MessageType.Welcome, "host must reply WELCOME");
+    var welcome = WelcomePayloadCodec.Decode(frames.First().Payload);
+
+    await transport.SendAsync(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", welcome.Challenge)),
+        1, mustUnderstand: true));
+    await WaitUntil(() => frames.Count == 2);
+    Assert(frames.Skip(1).First().MessageType == MessageType.AuthOk, "host must reply AUTH_OK");
+
+    await transport.SendAsync(MakeFrame(MessageType.InputEvent,
+        InputEventPayloadCodec.Encode(new InputEventPayload(new InputEvent("a", 0, 0, State: 1, PressCount: 1))),
+        2));
+    await Task.Delay(100);
+    Assert(host.Manager.IsActive("ctrl-42a8"), "session must be registered as active");
+    Assert(accepted.Count == 1, "SessionHost must raise SessionAccepted");
+
+    await transport.CloseAsync();
+    await run;
+    await host.StopAsync();
+
+    Console.WriteLine("M1.4.2: loopback SessionHost smoke tests passed.");
+}
+
+static byte[] MakeFrame(byte type, byte[] payload, ushort sequence = 0,
+    bool ackRequested = false, bool mustUnderstand = false, byte major = 1, ulong timestamp = 0)
+    => FrameBuilder.Build(type, payload, sequence, ackRequested, mustUnderstand, major, 0, timestamp);
+
+static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlusher) CreateSession(
+    ulong now = 0, IAuthenticator? authenticator = null)
+{
+    var connection = new FakeTransportConnection();
+    var listener = new RecordingSessionListener();
+    var flusher = new RecordingFlusher();
+    var session = new Session(
+        connection,
+        authenticator ?? new AuthenticatorStub(["ctrl-42a8"], "123456"),
+        listener,
+        new SessionOptions
+        {
+            NowMs = () => now,
+            SessionIdFactory = () => TestData.SessionId,
+            ChallengeFactory = () => TestData.Challenge,
+        },
+        flusher);
+    return (session, connection, listener, flusher);
+}
+
+static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlusher) HandshakeToReady(
+    ulong now = 0, string deviceId = "ctrl-42a8", bool pairing = false, string credential = "")
+{
+    var (session, conn, listener, flusher) = CreateSession(now);
+    conn.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload(deviceId, "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var welcome = WelcomePayloadCodec.Decode(conn.SentFrames[^1].Payload);
+    var auth = pairing
+        ? new AuthPayload(0x02, credential, deviceId, welcome.Challenge)
+        : new AuthPayload(0x01, "", deviceId, welcome.Challenge);
+    conn.Emit(MakeFrame(MessageType.Auth, AuthPayloadCodec.Encode(auth), 1, mustUnderstand: true));
+    if (session.State != ServerSessionState.Ready)
+        throw new Exception("HandshakeToReady: session did not reach Ready.");
+    return (session, conn, listener, flusher);
+}
+
 static ProtocolFrame MakeEchoFrame(ushort sequence, byte[] payload) => new(
     VersionMajor: 0x01,
     VersionMinor: 0x00,
@@ -996,4 +1397,64 @@ static void Assert(bool condition, string name)
 {
     if (!condition)
         throw new Exception($"Assertion failed: {name}.");
+}
+
+sealed class TestData
+{
+    public static readonly byte[] SessionId = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
+
+    public static readonly byte[] Challenge = Enumerable.Range(0x10, 32).Select(i => (byte)i).ToArray();
+}
+
+sealed class FakeTransportConnection : ITransportConnection
+{
+    public bool IsConnected => Volatile.Read(ref _closed) == 0;
+    public List<byte[]> Sent { get; } = new();
+    public List<ProtocolFrame> SentFrames { get; } = new();
+    public event Action<ProtocolFrame>? FrameReceived;
+    public event Action<string>? Disconnected;
+    private int _closed;
+
+    public Task SendAsync(byte[] frame, CancellationToken cancellationToken = default)
+    {
+        var copy = frame.ToArray();
+        Sent.Add(copy);
+        SentFrames.Add(FrameCodec.Decode(copy));
+        return Task.CompletedTask;
+    }
+
+    public void Emit(byte[] rawFrame) => FrameReceived?.Invoke(FrameCodec.Decode(rawFrame));
+
+    public void EmitDisconnected(string reason)
+    {
+        if (Interlocked.Exchange(ref _closed, 1) != 0)
+            return;
+        Disconnected?.Invoke(reason);
+    }
+
+    public Task CloseAsync()
+    {
+        EmitDisconnected("Connection closed.");
+        return Task.CompletedTask;
+    }
+}
+
+sealed class RecordingSessionListener : ISessionListener
+{
+    public List<ServerSessionState> States { get; } = new();
+    public List<string> Errors { get; } = new();
+    public List<InputEvent> InputEvents { get; } = new();
+    public List<InputSnapshotPayload> Snapshots { get; } = new();
+
+    public void OnStateChanged(ServerSessionState state) => States.Add(state);
+    public void OnError(string message) => Errors.Add(message);
+    public void OnInputEvent(InputEvent inputEvent) => InputEvents.Add(inputEvent);
+    public void OnInputSnapshot(InputSnapshotPayload snapshot) => Snapshots.Add(snapshot);
+}
+
+sealed class RecordingFlusher : IInputStateFlusher
+{
+    public int FlushCount { get; private set; }
+    public void Flush() => FlushCount++;
 }

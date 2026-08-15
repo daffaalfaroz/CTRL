@@ -24,6 +24,13 @@ public static class FrameCodec
     public const byte MustUnderstand = 0x08;
     private const byte AllowedFlags = AckRequested | MustUnderstand;
 
+    /// <summary>
+    /// Flags reserved for future versions (SECURE, COMPRESSED and the top four
+    /// bits). Decode must NOT reject them (D2): the session layer answers with
+    /// ERROR forbidden + close. Encode keeps rejecting them defensively.
+    /// </summary>
+    public const byte ReservedFlagsMask = 0xF6;
+
     public static byte[] Encode(ProtocolFrame frame)
     {
         Validate(frame);
@@ -51,8 +58,6 @@ public static class FrameCodec
             throw new ProtocolException("Invalid frame magic.");
 
         var flags = bytes[4];
-        if ((flags & ~AllowedFlags) != 0)
-            throw new ProtocolException("Reserved frame flags must be zero in v1.");
 
         var payloadLength = ReadUInt16BigEndian(bytes, 6);
         var expectedLength = ProtocolFrame.HeaderSize + payloadLength;
