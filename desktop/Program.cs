@@ -7,8 +7,12 @@ RunWelcomeCodecSmokeTests();
 RunAuthCodecSmokeTests();
 RunAuthOkCodecSmokeTests();
 RunAuthDeniedCodecSmokeTests();
+RunErrorCodecSmokeTests();
+RunDisconnectCodecSmokeTests();
+RunHeartbeatCodecSmokeTests();
+RunPongCodecSmokeTests();
 
-Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 protocol smoke tests passed.");
+Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 protocol smoke tests passed.");
 
 static void RunFrameCodecSmokeTests()
 {
@@ -316,6 +320,146 @@ static void RunAuthDeniedCodecSmokeTests()
     ExpectProtocolException(() => AuthDeniedPayloadCodec.Decode([..encoded, 0x00]), "auth_denied extra bytes");
     ExpectProtocolException(() => AuthDeniedPayloadCodec.Decode([0x04, 0x00]), "auth_denied unknown reason (decode)");
     ExpectProtocolException(() => AuthDeniedPayloadCodec.Decode([0x01, 0x01, 0xFF]), "auth_denied invalid utf8 message");
+}
+
+static void RunErrorCodecSmokeTests()
+{
+    var error = new ErrorPayload(0x02, 0x01, "auth failed");
+    var encoded = ErrorPayloadCodec.Encode(error);
+
+    byte[] expected =
+    [
+        0x02, 0x01, 0x00, 0x0B,
+        0x61, 0x75, 0x74, 0x68, 0x20, 0x66, 0x61, 0x69, 0x6C, 0x65, 0x64
+    ];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("ERROR wire bytes do not match docs/protocol.md 19.11.");
+
+    var decoded = ErrorPayloadCodec.Decode(encoded);
+    if (decoded.Code != error.Code ||
+        decoded.Severity != error.Severity ||
+        decoded.Message != error.Message)
+        throw new Exception("ERROR round-trip failed.");
+
+    foreach (var code in new byte[]
+    {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0xFF
+    })
+    {
+        var rt = ErrorPayloadCodec.Decode(
+            ErrorPayloadCodec.Encode(new ErrorPayload(code, 0, "x")));
+        if (rt.Code != code)
+            throw new Exception("ERROR code round-trip failed.");
+    }
+
+    foreach (var severity in new byte[] { 0x00, 0x01, 0x02 })
+    {
+        var rt = ErrorPayloadCodec.Decode(
+            ErrorPayloadCodec.Encode(new ErrorPayload(0x01, severity, "x")));
+        if (rt.Severity != severity)
+            throw new Exception("ERROR severity round-trip failed.");
+    }
+
+    var emptyMsg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, ""));
+    if (emptyMsg.Length != 4 || emptyMsg[2] != 0x00 || emptyMsg[3] != 0x00)
+        throw new Exception("ERROR empty message must encode length 0 (uint16 BE).");
+    var emptyDecoded = ErrorPayloadCodec.Decode(emptyMsg);
+    if (emptyDecoded.Message.Length != 0)
+        throw new Exception("ERROR empty message round-trip failed.");
+
+    var utf8Msg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, "échec"));
+    if (utf8Msg[2] != 0x00 || utf8Msg[3] != 6)
+        throw new Exception("ERROR messageLength must be uint16 BE UTF-8 byte length.");
+
+    var boundary = new ErrorPayload(0x01, 0x00, new string('a', 1024));
+    var boundaryDecoded = ErrorPayloadCodec.Decode(ErrorPayloadCodec.Encode(boundary));
+    if (boundaryDecoded.Message.Length != 1024)
+        throw new Exception("ERROR 1024-byte message boundary failed.");
+
+    ExpectProtocolException(() => ErrorPayloadCodec.Encode(new ErrorPayload(0x0A, 0x00, "x")), "error unknown code (encode)");
+    ExpectProtocolException(() => ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x03, "x")), "error unknown severity (encode)");
+    ExpectProtocolException(() => ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, new string('a', 1025))), "error message over 1024 (encode)");
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(encoded[..^1]), "error truncated");
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode([..encoded, 0x00]), "error extra bytes");
+
+    var badCode = (byte[])encoded.Clone();
+    badCode[0] = 0x0A;
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(badCode), "error unknown code (decode)");
+
+    var badSeverity = (byte[])encoded.Clone();
+    badSeverity[1] = 0x03;
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(badSeverity), "error unknown severity (decode)");
+
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode([0x02, 0x01, 0x00, 0x01, 0xFF]), "error invalid utf8 message");
+
+    var overLimit = new byte[] { 0x02, 0x01, 0x04, 0x01 }.Concat(new byte[1025]).ToArray();
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(overLimit), "error message over 1024 (decode)");
+}
+
+static void RunDisconnectCodecSmokeTests()
+{
+    var disconnect = new DisconnectPayload(0x00);
+    var encoded = DisconnectPayloadCodec.Encode(disconnect);
+
+    byte[] expected = [0x00];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("DISCONNECT wire bytes do not match docs/protocol.md 19.10.");
+
+    var decoded = DisconnectPayloadCodec.Decode(encoded);
+    if (decoded.Reason != 0x00)
+        throw new Exception("DISCONNECT round-trip failed.");
+
+    foreach (var reason in new byte[] { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05 })
+    {
+        var rt = DisconnectPayloadCodec.Decode(
+            DisconnectPayloadCodec.Encode(new DisconnectPayload(reason)));
+        if (rt.Reason != reason)
+            throw new Exception("DISCONNECT reason round-trip failed.");
+    }
+
+    ExpectProtocolException(() => DisconnectPayloadCodec.Encode(new DisconnectPayload(0x06)), "disconnect unknown reason (encode)");
+    ExpectProtocolException(() => DisconnectPayloadCodec.Decode([0x06]), "disconnect unknown reason (decode)");
+    ExpectProtocolException(() => DisconnectPayloadCodec.Decode([]), "disconnect truncated");
+    ExpectProtocolException(() => DisconnectPayloadCodec.Decode([0x00, 0x00]), "disconnect extra bytes");
+}
+
+static void RunHeartbeatCodecSmokeTests()
+{
+    var heartbeat = new HeartbeatPayload(0x0000018D9E8E2C00UL);
+    var encoded = HeartbeatPayloadCodec.Encode(heartbeat);
+
+    byte[] expected = [0x00, 0x00, 0x01, 0x8D, 0x9E, 0x8E, 0x2C, 0x00];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("HEARTBEAT wire bytes do not match docs/protocol.md 19.9.");
+
+    var decoded = HeartbeatPayloadCodec.Decode(encoded);
+    if (decoded.ClientSendTime != heartbeat.ClientSendTime)
+        throw new Exception("HEARTBEAT round-trip failed.");
+
+    ExpectProtocolException(() => HeartbeatPayloadCodec.Decode(encoded[..^1]), "heartbeat truncated");
+    ExpectProtocolException(() => HeartbeatPayloadCodec.Decode([..encoded, 0x00]), "heartbeat extra bytes");
+}
+
+static void RunPongCodecSmokeTests()
+{
+    var pong = new PongPayload(0x0000018D9E8E2C00UL, 0x0000018D9E8E2C05UL);
+    var encoded = PongPayloadCodec.Encode(pong);
+
+    byte[] expected =
+    [
+        0x00, 0x00, 0x01, 0x8D, 0x9E, 0x8E, 0x2C, 0x00,
+        0x00, 0x00, 0x01, 0x8D, 0x9E, 0x8E, 0x2C, 0x05
+    ];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("PONG wire bytes do not match docs/protocol.md 19.9.");
+
+    var decoded = PongPayloadCodec.Decode(encoded);
+    if (decoded.ClientSendTime != pong.ClientSendTime ||
+        decoded.ServerTime != pong.ServerTime)
+        throw new Exception("PONG round-trip failed.");
+
+    ExpectProtocolException(() => PongPayloadCodec.Decode(encoded[..^1]), "pong truncated");
+    ExpectProtocolException(() => PongPayloadCodec.Decode([..encoded, 0x00]), "pong extra bytes");
 }
 
 static void ExpectProtocolException(Action action, string name)
