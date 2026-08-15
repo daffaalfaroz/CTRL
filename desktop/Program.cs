@@ -1,4 +1,8 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
 using CTRL.Desktop.Protocol;
+using CTRL.Desktop.Transport;
 
 RunFrameCodecSmokeTests();
 RunPayloadPrimitiveSmokeTests();
@@ -15,8 +19,10 @@ RunAckCodecSmokeTests();
 RunInputEventCodecSmokeTests();
 RunInputSnapshotCodecSmokeTests();
 RunInputResetCodecSmokeTests();
+RunFrameBufferSmokeTests();
+await RunLoopbackTransportSmokeTests();
 
-Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 protocol smoke tests passed.");
+Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 
 static void RunFrameCodecSmokeTests()
 {
@@ -749,4 +755,170 @@ static void ExpectProtocolException(Action action, string name)
     catch (ProtocolException)
     {
     }
+}
+
+static void RunFrameBufferSmokeTests()
+{
+    var feed = FrameCodec.Encode(MakeEchoFrame(0x0012, [0x10, 0x20]));
+    if (feed.Length != ProtocolFrame.HeaderSize + 2)
+        throw new Exception("Unexpected frame feed length.");
+
+    var perByte = new FrameBuffer();
+    for (var i = 0; i < feed.Length - 1; i++)
+    {
+        perByte.Append(new[] { feed[i] });
+        if (perByte.TryReadFrame(out _) || !perByte.HasBufferedData)
+            throw new Exception("FrameBuffer: premature frame during per-byte feed.");
+    }
+    perByte.Append(new[] { feed[^1] });
+    if (!perByte.TryReadFrame(out var whole) || !whole.SequenceEqual(feed))
+        throw new Exception("FrameBuffer: per-byte frame mismatch.");
+    if (perByte.HasBufferedData)
+        throw new Exception("FrameBuffer: trailing data after per-byte frame.");
+
+    var payloadSplit = new FrameBuffer();
+    payloadSplit.Append(feed.Take(feed.Length - 1).ToArray());
+    if (payloadSplit.TryReadFrame(out _) || !payloadSplit.HasBufferedData)
+        throw new Exception("FrameBuffer: frame read before full payload.");
+    payloadSplit.Append(feed.Skip(feed.Length - 1).ToArray());
+    if (!payloadSplit.TryReadFrame(out var frame1) || !frame1.SequenceEqual(feed))
+        throw new Exception("FrameBuffer: frame not read after payload completion.");
+    if (payloadSplit.HasBufferedData)
+        throw new Exception("FrameBuffer: trailing data after single frame.");
+
+    for (var split = 0; split <= feed.Length; split++)
+    {
+        var f = new FrameBuffer();
+        f.Append(feed.Take(split).ToArray());
+        f.Append(feed.Skip(split).ToArray());
+        if (!f.TryReadFrame(out var got) || !got.SequenceEqual(feed))
+            throw new Exception($"FrameBuffer: split at index {split} failed.");
+    }
+
+    var multi = new FrameBuffer();
+    var expected = new List<byte[]>();
+    var chunk = new List<byte>();
+    for (var i = 0; i < 3; i++)
+    {
+        var encoded = FrameCodec.Encode(MakeEchoFrame((ushort)(0x0001 + i), [(byte)i]));
+        chunk.AddRange(encoded);
+        expected.Add(encoded);
+    }
+    multi.Append(chunk.ToArray());
+    for (var i = 0; i < 3; i++)
+    {
+        if (!multi.TryReadFrame(out var got) || !got.SequenceEqual(expected[i]))
+            throw new Exception("FrameBuffer: multiple frames per chunk failed.");
+    }
+    if (multi.HasBufferedData)
+        throw new Exception("FrameBuffer: leftover data after multiple frames.");
+
+    var framePlusPartial = new FrameBuffer();
+    var one = FrameCodec.Encode(MakeEchoFrame(0x01, [0xAA]));
+    var two = FrameCodec.Encode(MakeEchoFrame(0x02, [0xBB]));
+    framePlusPartial.Append(one.Concat(two.Take(7)).ToArray());
+    if (!framePlusPartial.TryReadFrame(out var first) || !first.SequenceEqual(one))
+        throw new Exception("FrameBuffer: frame + partial next failed (first).");
+    if (!framePlusPartial.HasBufferedData)
+        throw new Exception("FrameBuffer: partial next frame not buffered.");
+    framePlusPartial.Append(two.Skip(7).ToArray());
+    if (!framePlusPartial.TryReadFrame(out var second) || !second.SequenceEqual(two))
+        throw new Exception("FrameBuffer: frame + partial next failed (second).");
+    if (framePlusPartial.HasBufferedData)
+        throw new Exception("FrameBuffer: leftover after frame + partial.");
+
+    var bulk = new FrameBuffer();
+    for (var i = 0; i < 100; i++)
+        bulk.Append(FrameCodec.Encode(MakeEchoFrame((ushort)(0x0001 + i), [(byte)i])));
+    for (var i = 0; i < 100; i++)
+    {
+        if (!bulk.TryReadFrame(out _))
+            throw new Exception("FrameBuffer: bulk frame missing.");
+    }
+    if (bulk.HasBufferedData)
+        throw new Exception("FrameBuffer: bulk leftover.");
+
+    Console.WriteLine("M1.3: frame buffer smoke tests passed.");
+}
+
+static async Task RunLoopbackTransportSmokeTests()
+{
+    var server = new TcpServer(0);
+    var received = new ConcurrentQueue<ProtocolFrame>();
+    var disconnected = new ConcurrentQueue<string>();
+
+    server.ClientConnected += async connection =>
+    {
+        Assert(connection.NoDelay, "server NoDelay not set");
+        connection.FrameReceived += frame => received.Enqueue(frame);
+        connection.Disconnected += reason => disconnected.Enqueue(reason);
+        await connection.SendAsync(FrameCodec.Encode(MakeEchoFrame(0x01, [0x55])));
+    };
+
+    _ = server.StartAsync();
+    await WaitUntil(() => server.LocalPort > 0);
+    Assert(server.LocalPort > 0, "server ephemeral port not assigned");
+
+    var client = new TcpClient();
+    await client.ConnectAsync(IPAddress.Loopback, server.LocalPort);
+    var transport = new TcpConnection(client);
+    Assert(transport.NoDelay, "client NoDelay not set");
+    var clientFrames = new ConcurrentQueue<ProtocolFrame>();
+    var clientDisconnected = new ConcurrentQueue<string>();
+    transport.FrameReceived += frame => clientFrames.Enqueue(frame);
+    transport.Disconnected += reason => clientDisconnected.Enqueue(reason);
+    var run = transport.RunAsync();
+
+    await transport.SendAsync(FrameCodec.Encode(MakeEchoFrame(0x02, [0x66])));
+    await WaitUntil(() => received.Count == 1 && clientFrames.Count == 1);
+    Assert(received.Count == 1, "server did not receive echo");
+    Assert(clientFrames.Count == 1, "client did not receive echo");
+    Assert(FramesEqual(received.First(), MakeEchoFrame(0x02, [0x66])), "server echo mismatch");
+    Assert(FramesEqual(clientFrames.First(), MakeEchoFrame(0x01, [0x55])), "client echo mismatch");
+
+    await transport.CloseAsync();
+    await run;
+    await WaitUntil(() => clientDisconnected.Count == 1);
+    Assert(clientDisconnected.Count == 1, "client disconnected not reported exactly once");
+    await WaitUntil(() => disconnected.Count == 1);
+    Assert(disconnected.Count == 1, "server disconnected not reported exactly once");
+
+    await server.StopAsync();
+
+    Console.WriteLine("M1.3: loopback transport smoke tests passed.");
+}
+
+static ProtocolFrame MakeEchoFrame(ushort sequence, byte[] payload) => new(
+    VersionMajor: 0x01,
+    VersionMinor: 0x00,
+    Flags: 0,
+    MessageType: 0xFF,
+    Sequence: sequence,
+    Timestamp: 0,
+    Payload: payload);
+
+static bool FramesEqual(ProtocolFrame a, ProtocolFrame b) =>
+    a.VersionMajor == b.VersionMajor &&
+    a.VersionMinor == b.VersionMinor &&
+    a.Flags == b.Flags &&
+    a.MessageType == b.MessageType &&
+    a.Sequence == b.Sequence &&
+    a.Timestamp == b.Timestamp &&
+    a.Payload.SequenceEqual(b.Payload);
+
+static async Task WaitUntil(Func<bool> condition, int timeoutMs = 5000)
+{
+    var deadline = Environment.TickCount64 + timeoutMs;
+    while (!condition())
+    {
+        if (Environment.TickCount64 > deadline)
+            throw new Exception("Timed out waiting for condition.");
+        await Task.Delay(10);
+    }
+}
+
+static void Assert(bool condition, string name)
+{
+    if (!condition)
+        throw new Exception($"Assertion failed: {name}.");
 }
