@@ -184,6 +184,52 @@ void main() {
       await waitUntil(() => disconnects.length == 1);
       expect(disconnects.single, contains('mid-frame'));
     });
+
+    test('protocol decode error emits exactly one disconnect and cleans up',
+        () async {
+      final serverClosed = Completer<void>();
+      serverSocket.listen((socket) {
+        socket.add(_malformedFrame());
+        socket.listen(
+          (_) {},
+          onDone: () {
+            if (!serverClosed.isCompleted) {
+              serverClosed.complete();
+            }
+          },
+        );
+      });
+
+      final transport = TcpTransport(port: serverSocket.port);
+      final disconnects = <String>[];
+      transport.disconnected.listen(disconnects.add);
+      await transport.connect();
+
+      await waitUntil(() => disconnects.length == 1);
+      expect(disconnects.single, contains('Protocol error'));
+      expect(transport.isConnected, isFalse);
+
+      await waitUntil(() => serverClosed.isCompleted);
+      await transport.close();
+      expect(disconnects.length, 1);
+    });
+
+    test('close after a protocol error does not duplicate the disconnect',
+        () async {
+      serverSocket.listen((socket) {
+        socket.add(_malformedFrame());
+      });
+
+      final transport = TcpTransport(port: serverSocket.port);
+      final disconnects = <String>[];
+      transport.disconnected.listen(disconnects.add);
+      await transport.connect();
+
+      await waitUntil(() => disconnects.length == 1);
+      await transport.close();
+      await transport.close();
+      expect(disconnects.length, 1);
+    });
   });
 }
 
@@ -196,6 +242,8 @@ ProtocolFrame _echoFrame(int sequence, List<int> payload) => ProtocolFrame(
       timestamp: 0,
       payload: Uint8List.fromList(payload),
     );
+
+Uint8List _malformedFrame() => Uint8List(ProtocolFrame.headerSize);
 
 bool _framesEqual(ProtocolFrame a, ProtocolFrame b) =>
     a.versionMajor == b.versionMajor &&

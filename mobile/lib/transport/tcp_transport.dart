@@ -44,37 +44,71 @@ class TcpTransport implements TransportConnection {
 
   /// Establishes the TCP connection and starts the read loop.
   Future<void> connect() async {
-    final socket = await Socket.connect(
-      _host,
-      _port,
-      timeout: _connectTimeout,
-    );
-    socket.setOption(SocketOption.tcpNoDelay, true);
-    _socket = socket;
-    _isConnected = true;
+    Socket? socket;
+    try {
+      socket = await Socket.connect(
+        _host,
+        _port,
+        timeout: _connectTimeout,
+      );
+      socket.setOption(SocketOption.tcpNoDelay, true);
+      _socket = socket;
+      _isConnected = true;
 
-    _subscription = socket.listen(
-      (data) {
-        _frameBuffer.append(data);
-        while (true) {
-          final frame = _frameBuffer.tryReadFrame();
-          if (frame == null) {
-            break;
+      _subscription = socket.listen(
+        _onData,
+        onDone: () {
+          if (_frameBuffer.hasBufferedData) {
+            _reportDisconnected('Connection closed mid-frame.');
+          } else {
+            _reportDisconnected('Remote peer closed the connection.');
           }
-          _framesController.add(FrameCodec.decode(frame));
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          _reportDisconnected('Connection error: $error');
+        },
+      );
+    } catch (_) {
+      if (socket != null) {
+        try {
+          socket.destroy();
+        } catch (_) {}
+      }
+      _socket = null;
+      _subscription = null;
+      _isConnected = false;
+      rethrow;
+    }
+  }
+
+  void _onData(List<int> data) {
+    try {
+      _frameBuffer.append(data);
+      while (true) {
+        final frame = _frameBuffer.tryReadFrame();
+        if (frame == null) {
+          break;
         }
-      },
-      onDone: () {
-        if (_frameBuffer.hasBufferedData) {
-          _reportDisconnected('Connection closed mid-frame.');
-        } else {
-          _reportDisconnected('Remote peer closed the connection.');
-        }
-      },
-      onError: (Object error, StackTrace stackTrace) {
-        _reportDisconnected('Connection error: $error');
-      },
-    );
+        _framesController.add(FrameCodec.decode(frame));
+      }
+    } on ProtocolException catch (error) {
+      _failWithProtocolError(error);
+    }
+  }
+
+  void _failWithProtocolError(ProtocolException error) {
+    try {
+      _subscription?.cancel();
+    } catch (_) {}
+    _subscription = null;
+    final socket = _socket;
+    _socket = null;
+    if (socket != null) {
+      try {
+        socket.destroy();
+      } catch (_) {}
+    }
+    _reportDisconnected('Protocol error: ${error.message}');
   }
 
   @override
@@ -90,6 +124,7 @@ class TcpTransport implements TransportConnection {
   @override
   Future<void> close() async {
     await _subscription?.cancel();
+    _subscription = null;
     final socket = _socket;
     _socket = null;
     if (socket != null) {
