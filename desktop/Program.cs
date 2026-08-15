@@ -7,8 +7,16 @@ RunWelcomeCodecSmokeTests();
 RunAuthCodecSmokeTests();
 RunAuthOkCodecSmokeTests();
 RunAuthDeniedCodecSmokeTests();
+RunErrorCodecSmokeTests();
+RunDisconnectCodecSmokeTests();
+RunHeartbeatCodecSmokeTests();
+RunPongCodecSmokeTests();
+RunAckCodecSmokeTests();
+RunInputEventCodecSmokeTests();
+RunInputSnapshotCodecSmokeTests();
+RunInputResetCodecSmokeTests();
 
-Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 protocol smoke tests passed.");
+Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 protocol smoke tests passed.");
 
 static void RunFrameCodecSmokeTests()
 {
@@ -316,6 +324,419 @@ static void RunAuthDeniedCodecSmokeTests()
     ExpectProtocolException(() => AuthDeniedPayloadCodec.Decode([..encoded, 0x00]), "auth_denied extra bytes");
     ExpectProtocolException(() => AuthDeniedPayloadCodec.Decode([0x04, 0x00]), "auth_denied unknown reason (decode)");
     ExpectProtocolException(() => AuthDeniedPayloadCodec.Decode([0x01, 0x01, 0xFF]), "auth_denied invalid utf8 message");
+}
+
+static void RunErrorCodecSmokeTests()
+{
+    var error = new ErrorPayload(0x02, 0x01, "auth failed");
+    var encoded = ErrorPayloadCodec.Encode(error);
+
+    byte[] expected =
+    [
+        0x02, 0x01, 0x00, 0x0B,
+        0x61, 0x75, 0x74, 0x68, 0x20, 0x66, 0x61, 0x69, 0x6C, 0x65, 0x64
+    ];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("ERROR wire bytes do not match docs/protocol.md 19.11.");
+
+    var decoded = ErrorPayloadCodec.Decode(encoded);
+    if (decoded.Code != error.Code ||
+        decoded.Severity != error.Severity ||
+        decoded.Message != error.Message)
+        throw new Exception("ERROR round-trip failed.");
+
+    foreach (var code in new byte[]
+    {
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0xFF
+    })
+    {
+        var rt = ErrorPayloadCodec.Decode(
+            ErrorPayloadCodec.Encode(new ErrorPayload(code, 0, "x")));
+        if (rt.Code != code)
+            throw new Exception("ERROR code round-trip failed.");
+    }
+
+    foreach (var severity in new byte[] { 0x00, 0x01, 0x02 })
+    {
+        var rt = ErrorPayloadCodec.Decode(
+            ErrorPayloadCodec.Encode(new ErrorPayload(0x01, severity, "x")));
+        if (rt.Severity != severity)
+            throw new Exception("ERROR severity round-trip failed.");
+    }
+
+    var emptyMsg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, ""));
+    if (emptyMsg.Length != 4 || emptyMsg[2] != 0x00 || emptyMsg[3] != 0x00)
+        throw new Exception("ERROR empty message must encode length 0 (uint16 BE).");
+    var emptyDecoded = ErrorPayloadCodec.Decode(emptyMsg);
+    if (emptyDecoded.Message.Length != 0)
+        throw new Exception("ERROR empty message round-trip failed.");
+
+    var utf8Msg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, "échec"));
+    if (utf8Msg[2] != 0x00 || utf8Msg[3] != 6)
+        throw new Exception("ERROR messageLength must be uint16 BE UTF-8 byte length.");
+
+    var boundary = new ErrorPayload(0x01, 0x00, new string('a', 1024));
+    var boundaryDecoded = ErrorPayloadCodec.Decode(ErrorPayloadCodec.Encode(boundary));
+    if (boundaryDecoded.Message.Length != 1024)
+        throw new Exception("ERROR 1024-byte message boundary failed.");
+
+    ExpectProtocolException(() => ErrorPayloadCodec.Encode(new ErrorPayload(0x0A, 0x00, "x")), "error unknown code (encode)");
+    ExpectProtocolException(() => ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x03, "x")), "error unknown severity (encode)");
+    ExpectProtocolException(() => ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, new string('a', 1025))), "error message over 1024 (encode)");
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(encoded[..^1]), "error truncated");
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode([..encoded, 0x00]), "error extra bytes");
+
+    var badCode = (byte[])encoded.Clone();
+    badCode[0] = 0x0A;
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(badCode), "error unknown code (decode)");
+
+    var badSeverity = (byte[])encoded.Clone();
+    badSeverity[1] = 0x03;
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(badSeverity), "error unknown severity (decode)");
+
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode([0x02, 0x01, 0x00, 0x01, 0xFF]), "error invalid utf8 message");
+
+    var overLimit = new byte[] { 0x02, 0x01, 0x04, 0x01 }.Concat(new byte[1025]).ToArray();
+    ExpectProtocolException(() => ErrorPayloadCodec.Decode(overLimit), "error message over 1024 (decode)");
+}
+
+static void RunDisconnectCodecSmokeTests()
+{
+    var disconnect = new DisconnectPayload(0x00);
+    var encoded = DisconnectPayloadCodec.Encode(disconnect);
+
+    byte[] expected = [0x00];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("DISCONNECT wire bytes do not match docs/protocol.md 19.10.");
+
+    var decoded = DisconnectPayloadCodec.Decode(encoded);
+    if (decoded.Reason != 0x00)
+        throw new Exception("DISCONNECT round-trip failed.");
+
+    foreach (var reason in new byte[] { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05 })
+    {
+        var rt = DisconnectPayloadCodec.Decode(
+            DisconnectPayloadCodec.Encode(new DisconnectPayload(reason)));
+        if (rt.Reason != reason)
+            throw new Exception("DISCONNECT reason round-trip failed.");
+    }
+
+    ExpectProtocolException(() => DisconnectPayloadCodec.Encode(new DisconnectPayload(0x06)), "disconnect unknown reason (encode)");
+    ExpectProtocolException(() => DisconnectPayloadCodec.Decode([0x06]), "disconnect unknown reason (decode)");
+    ExpectProtocolException(() => DisconnectPayloadCodec.Decode([]), "disconnect truncated");
+    ExpectProtocolException(() => DisconnectPayloadCodec.Decode([0x00, 0x00]), "disconnect extra bytes");
+}
+
+static void RunHeartbeatCodecSmokeTests()
+{
+    var heartbeat = new HeartbeatPayload(0x0000018D9E8E2C00UL);
+    var encoded = HeartbeatPayloadCodec.Encode(heartbeat);
+
+    byte[] expected = [0x00, 0x00, 0x01, 0x8D, 0x9E, 0x8E, 0x2C, 0x00];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("HEARTBEAT wire bytes do not match docs/protocol.md 19.9.");
+
+    var decoded = HeartbeatPayloadCodec.Decode(encoded);
+    if (decoded.ClientSendTime != heartbeat.ClientSendTime)
+        throw new Exception("HEARTBEAT round-trip failed.");
+
+    ExpectProtocolException(() => HeartbeatPayloadCodec.Decode(encoded[..^1]), "heartbeat truncated");
+    ExpectProtocolException(() => HeartbeatPayloadCodec.Decode([..encoded, 0x00]), "heartbeat extra bytes");
+}
+
+static void RunPongCodecSmokeTests()
+{
+    var pong = new PongPayload(0x0000018D9E8E2C00UL, 0x0000018D9E8E2C05UL);
+    var encoded = PongPayloadCodec.Encode(pong);
+
+    byte[] expected =
+    [
+        0x00, 0x00, 0x01, 0x8D, 0x9E, 0x8E, 0x2C, 0x00,
+        0x00, 0x00, 0x01, 0x8D, 0x9E, 0x8E, 0x2C, 0x05
+    ];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("PONG wire bytes do not match docs/protocol.md 19.9.");
+
+    var decoded = PongPayloadCodec.Decode(encoded);
+    if (decoded.ClientSendTime != pong.ClientSendTime ||
+        decoded.ServerTime != pong.ServerTime)
+        throw new Exception("PONG round-trip failed.");
+
+    ExpectProtocolException(() => PongPayloadCodec.Decode(encoded[..^1]), "pong truncated");
+    ExpectProtocolException(() => PongPayloadCodec.Decode([..encoded, 0x00]), "pong extra bytes");
+}
+
+static void RunAckCodecSmokeTests()
+{
+    var ack = new AckPayload(0x1234, 0x0000018D9E8E2C00UL);
+    var encoded = AckPayloadCodec.Encode(ack);
+
+    byte[] expected =
+    [
+        0x12, 0x34,
+        0x00, 0x00, 0x01, 0x8D, 0x9E, 0x8E, 0x2C, 0x00
+    ];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("ACK wire bytes do not match docs/protocol.md 11.");
+
+    var decoded = AckPayloadCodec.Decode(encoded);
+    if (decoded != ack)
+        throw new Exception("ACK round-trip failed.");
+
+    ExpectProtocolException(() => AckPayloadCodec.Decode(encoded[..^1]), "ack truncated");
+    ExpectProtocolException(() => AckPayloadCodec.Decode([..encoded, 0x00]), "ack extra bytes");
+    ExpectProtocolException(() => AckPayloadCodec.Decode([]), "ack empty payload");
+}
+
+static void RunInputEventCodecSmokeTests()
+{
+    var button = new InputEvent(
+        "btn-fire",
+        InputEventCodec.KindButton,
+        InputEventCodec.FlagStateChanged,
+        State: InputEventCodec.StateDown,
+        PressCount: 1);
+    var buttonEncoded = InputEventPayloadCodec.Encode(new InputEventPayload(button));
+
+    byte[] buttonExpected =
+    [
+        0x08,
+        0x62, 0x74, 0x6E, 0x2D, 0x66, 0x69, 0x72, 0x65,
+        0x00, 0x01, 0x01, 0x00, 0x01
+    ];
+    if (!buttonEncoded.SequenceEqual(buttonExpected))
+        throw new Exception("INPUT_EVENT button wire bytes do not match docs/protocol.md 19.5.");
+    var buttonDecoded = InputEventPayloadCodec.Decode(buttonEncoded);
+    if (buttonDecoded.Event != button)
+        throw new Exception("INPUT_EVENT button round-trip failed.");
+
+    var axis = new InputEvent(
+        "thr", InputEventCodec.KindAxis, InputEventCodec.FlagStateChanged, Value: 0.5f);
+    var axisEncoded = InputEventPayloadCodec.Encode(new InputEventPayload(axis));
+
+    byte[] axisExpected =
+    [
+        0x03, 0x74, 0x68, 0x72,
+        0x01, 0x01,
+        0x3F, 0x00, 0x00, 0x00
+    ];
+    if (!axisEncoded.SequenceEqual(axisExpected))
+        throw new Exception("INPUT_EVENT axis wire bytes do not match docs/protocol.md 19.6.");
+    var axisDecoded = InputEventPayloadCodec.Decode(axisEncoded);
+    if (axisDecoded.Event != axis)
+        throw new Exception("INPUT_EVENT axis round-trip failed.");
+
+    var stick = new InputEvent(
+        "rs", InputEventCodec.KindStick, InputEventCodec.FlagStateChanged, X: -0.5f, Y: 0.25f);
+    var stickEncoded = InputEventPayloadCodec.Encode(new InputEventPayload(stick));
+
+    byte[] stickExpected =
+    [
+        0x02, 0x72, 0x73,
+        0x02, 0x01,
+        0xBF, 0x00, 0x00, 0x00,
+        0x3E, 0x80, 0x00, 0x00
+    ];
+    if (!stickEncoded.SequenceEqual(stickExpected))
+        throw new Exception("INPUT_EVENT stick wire bytes do not match docs/protocol.md 19.7.");
+    var stickDecoded = InputEventPayloadCodec.Decode(stickEncoded);
+    if (stickDecoded.Event != stick)
+        throw new Exception("INPUT_EVENT stick round-trip failed.");
+
+    var trigger = new InputEvent(
+        "t1", InputEventCodec.KindTrigger, InputEventCodec.FlagStateChanged, Value: 1.0f);
+    var triggerEncoded = InputEventPayloadCodec.Encode(new InputEventPayload(trigger));
+
+    byte[] triggerExpected =
+    [
+        0x02, 0x74, 0x31,
+        0x03, 0x01,
+        0x3F, 0x80, 0x00, 0x00
+    ];
+    if (!triggerEncoded.SequenceEqual(triggerExpected))
+        throw new Exception("INPUT_EVENT trigger wire bytes do not match docs/protocol.md 9.");
+    var triggerDecoded = InputEventPayloadCodec.Decode(triggerEncoded);
+    if (triggerDecoded.Event != trigger)
+        throw new Exception("INPUT_EVENT trigger round-trip failed.");
+
+    var hat = new InputEvent(
+        "dpad", InputEventCodec.KindHat, InputEventCodec.FlagStateChanged, HatValue: 1);
+    var hatEncoded = InputEventPayloadCodec.Encode(new InputEventPayload(hat));
+
+    byte[] hatExpected =
+    [
+        0x04, 0x64, 0x70, 0x61, 0x64,
+        0x04, 0x01,
+        0x01
+    ];
+    if (!hatEncoded.SequenceEqual(hatExpected))
+        throw new Exception("INPUT_EVENT hat wire bytes do not match docs/protocol.md 9.");
+    var hatDecoded = InputEventPayloadCodec.Decode(hatEncoded);
+    if (hatDecoded.Event != hat)
+        throw new Exception("INPUT_EVENT hat round-trip failed.");
+
+    for (byte hv = 0; hv <= 8; hv++)
+    {
+        var e = new InputEvent("h", InputEventCodec.KindHat, 0, HatValue: hv);
+        var rt = InputEventPayloadCodec.Decode(InputEventPayloadCodec.Encode(new InputEventPayload(e)));
+        if (rt.Event != e)
+            throw new Exception("INPUT_EVENT hat value round-trip failed.");
+    }
+
+    var utf8Id = new InputEvent(
+        "é", InputEventCodec.KindButton, 0, State: InputEventCodec.StateUp, PressCount: 0);
+    var utf8Encoded = InputEventPayloadCodec.Encode(new InputEventPayload(utf8Id));
+    if (utf8Encoded[0] != 2)
+        throw new Exception("controlId length must be the UTF-8 byte length.");
+
+    var maxId = new InputEvent(
+        new string('a', 64), InputEventCodec.KindButton, 0,
+        State: InputEventCodec.StateUp, PressCount: 0);
+    InputEventPayloadCodec.Decode(InputEventPayloadCodec.Encode(new InputEventPayload(maxId)));
+
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent(new string('a', 65), InputEventCodec.KindButton, 0,
+            State: InputEventCodec.StateUp, PressCount: 0))), "input_event controlId over 64 (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x41, ..new byte[65], 0x00, 0x00, 0x00, 0x00, 0x00]), "input_event controlId over 64 (decode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), "input_event controlId zero length");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00]), "input_event invalid utf8 controlId");
+
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", 0x05, 0))), "input_event unknown kind (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x05, 0x00]), "input_event unknown kind (decode)");
+
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", InputEventCodec.KindButton, 0x04,
+            State: InputEventCodec.StateUp, PressCount: 0))), "input_event invalid flags (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x00, 0x04, 0x00, 0x00, 0x00]), "input_event invalid flags (decode)");
+
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", InputEventCodec.KindButton, 0, State: 0x02, PressCount: 0))),
+        "input_event invalid button state (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x00, 0x00, 0x02, 0x00, 0x00]), "input_event invalid button state (decode)");
+
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", InputEventCodec.KindAxis, 0, Value: float.NaN))),
+        "input_event NaN axis (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x01, 0x00, 0x7F, 0xC0, 0x00, 0x00]), "input_event NaN axis (decode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x01, 0x00, 0x7F, 0x80, 0x00, 0x00]), "input_event +Inf axis (decode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", InputEventCodec.KindAxis, 0, Value: 1.5f))),
+        "input_event axis over range (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x01, 0x00, 0x3F, 0xC0, 0x00, 0x00]), "input_event axis over range (decode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", InputEventCodec.KindAxis, 0, Value: -0.01f))),
+        "input_event axis under range (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x01, 0x00, 0xBC, 0x23, 0xD7, 0x0A]), "input_event axis under range (decode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", InputEventCodec.KindStick, 0, X: -1.01f, Y: 0))),
+        "input_event stick out of range (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x02, 0x00, 0xBF, 0x81, 0x47, 0xAE, 0x00, 0x00, 0x00, 0x00]),
+        "input_event stick out of range (decode)");
+
+    ExpectProtocolException(() => InputEventPayloadCodec.Encode(new InputEventPayload(
+        new InputEvent("a", InputEventCodec.KindHat, 0, HatValue: 9))),
+        "input_event hat 9 (encode)");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(
+        [0x01, 0x61, 0x04, 0x00, 0x09]), "input_event hat 9 (decode)");
+
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(buttonEncoded[..^1]), "input_event button truncated");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode([..buttonEncoded, 0x00]), "input_event button extra bytes");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(axisEncoded[..^1]), "input_event axis truncated");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(stickEncoded[..^1]), "input_event stick truncated");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(triggerEncoded[..^1]), "input_event trigger truncated");
+    ExpectProtocolException(() => InputEventPayloadCodec.Decode(hatEncoded[..^1]), "input_event hat truncated");
+}
+
+static void RunInputSnapshotCodecSmokeTests()
+{
+    var snapshot = new InputSnapshotPayload(new List<InputEvent>
+    {
+        new("btn-fire", InputEventCodec.KindButton, InputEventCodec.FlagStateChanged,
+            State: InputEventCodec.StateDown, PressCount: 5),
+        new("rs", InputEventCodec.KindStick, InputEventCodec.FlagStateChanged, X: 0f, Y: 0f)
+    });
+    var encoded = InputSnapshotPayloadCodec.Encode(snapshot);
+
+    byte[] expected =
+    [
+        0x00, 0x02,
+        0x08,
+        0x62, 0x74, 0x6E, 0x2D, 0x66, 0x69, 0x72, 0x65,
+        0x00, 0x01, 0x01, 0x00, 0x05,
+        0x02, 0x72, 0x73,
+        0x02, 0x01,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    ];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("INPUT_SNAPSHOT wire bytes do not match docs/protocol.md 19.8.");
+
+    var decoded = InputSnapshotPayloadCodec.Decode(encoded);
+    if (decoded.Events.Count != snapshot.Events.Count)
+        throw new Exception("INPUT_SNAPSHOT round-trip failed (count).");
+    for (var i = 0; i < decoded.Events.Count; i++)
+    {
+        if (decoded.Events[i] != snapshot.Events[i])
+            throw new Exception("INPUT_SNAPSHOT round-trip failed.");
+    }
+
+    var single = new InputSnapshotPayload(new List<InputEvent>
+    {
+        new("a", InputEventCodec.KindButton, 0, State: InputEventCodec.StateUp, PressCount: 0)
+    });
+    var singleDecoded = InputSnapshotPayloadCodec.Decode(InputSnapshotPayloadCodec.Encode(single));
+    if (singleDecoded.Events.Count != 1 || singleDecoded.Events[0] != single.Events[0])
+        throw new Exception("INPUT_SNAPSHOT single entry round-trip failed.");
+
+    ExpectProtocolException(() => InputSnapshotPayloadCodec.Encode(
+        new InputSnapshotPayload(new List<InputEvent>())), "snapshot empty (encode)");
+
+    var many = Enumerable.Range(0, 1025)
+        .Select(i => new InputEvent("a", InputEventCodec.KindButton, 0,
+            State: InputEventCodec.StateUp, PressCount: 0))
+        .ToList();
+    ExpectProtocolException(() => InputSnapshotPayloadCodec.Encode(
+        new InputSnapshotPayload(many)), "snapshot over 1024 (encode)");
+    ExpectProtocolException(() => InputSnapshotPayloadCodec.Decode([0x00, 0x00]), "snapshot zero entries (decode)");
+    ExpectProtocolException(() => InputSnapshotPayloadCodec.Decode(
+        [0x04, 0x01, 0x01, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00]), "snapshot over 1024 (decode)");
+    ExpectProtocolException(() => InputSnapshotPayloadCodec.Decode(encoded[..^1]), "snapshot truncated");
+    ExpectProtocolException(() => InputSnapshotPayloadCodec.Decode([..encoded, 0x00]), "snapshot extra bytes");
+    ExpectProtocolException(() => InputSnapshotPayloadCodec.Decode(
+        [0x00, 0x01, 0x01, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00]), "snapshot invalid utf8 controlId");
+}
+
+static void RunInputResetCodecSmokeTests()
+{
+    foreach (var reason in new byte[] { 0x00, 0x01, 0x02 })
+    {
+        var rt = InputResetPayloadCodec.Decode(
+            InputResetPayloadCodec.Encode(new InputResetPayload(reason)));
+        if (rt.Reason != reason)
+            throw new Exception("INPUT_RESET reason round-trip failed.");
+    }
+
+    var encoded = InputResetPayloadCodec.Encode(new InputResetPayload(0x00));
+    byte[] expected = [0x00];
+    if (!encoded.SequenceEqual(expected))
+        throw new Exception("INPUT_RESET wire bytes do not match docs/protocol.md 16.");
+
+    ExpectProtocolException(() => InputResetPayloadCodec.Encode(new InputResetPayload(0x03)), "input_reset unknown reason (encode)");
+    ExpectProtocolException(() => InputResetPayloadCodec.Decode([0x03]), "input_reset unknown reason (decode)");
+    ExpectProtocolException(() => InputResetPayloadCodec.Decode([]), "input_reset truncated");
+    ExpectProtocolException(() => InputResetPayloadCodec.Decode([0x00, 0x00]), "input_reset extra bytes");
 }
 
 static void ExpectProtocolException(Action action, string name)
