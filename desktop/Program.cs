@@ -17,7 +17,13 @@ if (encoded[0] != 0x43 || encoded[1] != 0x54 || encoded[6] != 0x00 || encoded[7]
     throw new Exception("Header encoding is not big-endian as required.");
 
 var decoded = FrameCodec.Decode(encoded);
-if (decoded != frame || !decoded.Payload.SequenceEqual(frame.Payload))
+if (decoded.VersionMajor != frame.VersionMajor ||
+    decoded.VersionMinor != frame.VersionMinor ||
+    decoded.Flags != frame.Flags ||
+    decoded.MessageType != frame.MessageType ||
+    decoded.Sequence != frame.Sequence ||
+    decoded.Timestamp != frame.Timestamp ||
+    !decoded.Payload.SequenceEqual(frame.Payload))
     throw new Exception("Frame round-trip failed.");
 
 ExpectProtocolException(() => FrameCodec.Decode(encoded[..^1]), "truncated frame");
