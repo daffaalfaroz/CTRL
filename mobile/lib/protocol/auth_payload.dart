@@ -53,7 +53,7 @@ class AuthPayloadCodec {
     final writer = PayloadWriter()
       ..writeUInt8(payload.credentialType)
       ..writeString(payload.credential)
-      ..writeString(payload.deviceId)
+      ..writeString(payload.deviceId, minLength: 1, maxLength: 64)
       ..writeBytes(payload.challengeResponse);
     return writer.toBytes();
   }
@@ -62,7 +62,7 @@ class AuthPayloadCodec {
     final reader = PayloadReader(bytes);
     final credentialType = reader.readUInt8();
     final credential = reader.readString();
-    final deviceId = reader.readString();
+    final deviceId = reader.readString(minLength: 1, maxLength: 64);
     final challengeResponse = reader.readBytes(32);
     reader.expectEnd();
 

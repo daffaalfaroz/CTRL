@@ -65,9 +65,11 @@ public sealed class PayloadReader
         return result;
     }
 
-    public string ReadString()
+    public string ReadString(int minLength = 0, int maxLength = byte.MaxValue)
     {
         var length = ReadUInt8();
+        if (length < minLength || length > maxLength)
+            throw new ProtocolException($"String must be {minLength}-{maxLength} UTF-8 bytes.");
         Require(length);
         var bytes = new byte[length];
         Array.Copy(_data, _offset, bytes, 0, length);

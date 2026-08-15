@@ -114,10 +114,33 @@ static void RunHelloCodecSmokeTests()
     if (decoded != hello)
         throw new Exception("HELLO round-trip failed.");
 
+    var oneByte = new HelloPayload("a", "0.1.0", 1, 0, 0x00000007);
+    var oneByteDecoded = HelloPayloadCodec.Decode(HelloPayloadCodec.Encode(oneByte));
+    if (oneByteDecoded != oneByte)
+        throw new Exception("HELLO 1-byte deviceId round-trip failed.");
+
+    var sixtyFour = new HelloPayload(new string('a', 64), new string('b', 64), 1, 0, 0x00000007);
+    var sixtyFourDecoded = HelloPayloadCodec.Decode(HelloPayloadCodec.Encode(sixtyFour));
+    if (sixtyFourDecoded != sixtyFour)
+        throw new Exception("HELLO 64-byte deviceId/clientVersion round-trip failed.");
+
+    var multiByte = new HelloPayload("é", "c", 1, 0, 0x00000007);
+    var multiByteBytes = HelloPayloadCodec.Encode(multiByte);
+    if (multiByteBytes[0] != 2)
+        throw new Exception("HELLO deviceId length must be UTF-8 byte count.");
+
+    ExpectProtocolException(() => HelloPayloadCodec.Encode(new HelloPayload("", "0.1.0", 1, 0, 0x00000007)), "hello empty deviceId (encode)");
+    ExpectProtocolException(() => HelloPayloadCodec.Encode(new HelloPayload(new string('a', 65), "0.1.0", 1, 0, 0x00000007)), "hello 65-byte deviceId (encode)");
+    ExpectProtocolException(() => HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "", 1, 0, 0x00000007)), "hello empty clientVersion (encode)");
+    ExpectProtocolException(() => HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", new string('c', 65), 1, 0, 0x00000007)), "hello 65-byte clientVersion (encode)");
     ExpectProtocolException(() => HelloPayloadCodec.Decode(encoded[..^1]), "truncated hello");
     ExpectProtocolException(() => HelloPayloadCodec.Decode([..encoded, 0x00]), "hello extra bytes");
     ExpectProtocolException(() => HelloPayloadCodec.Decode([0x01, 0xFF, 0x00, 0x00, 0x00, 0x00]), "hello invalid utf8");
     ExpectProtocolException(() => HelloPayloadCodec.Decode([0x03, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00]), "hello bad length prefix");
+    ExpectProtocolException(() => HelloPayloadCodec.Decode([0x00]), "hello empty deviceId (decode)");
+    ExpectProtocolException(() => HelloPayloadCodec.Decode([0x41]), "hello 65-byte deviceId (decode)");
+    ExpectProtocolException(() => HelloPayloadCodec.Decode([0x09, 0x63, 0x74, 0x72, 0x6C, 0x2D, 0x34, 0x32, 0x61, 0x38, 0x00]), "hello empty clientVersion (decode)");
+    ExpectProtocolException(() => HelloPayloadCodec.Decode([0x09, 0x63, 0x74, 0x72, 0x6C, 0x2D, 0x34, 0x32, 0x61, 0x38, 0x41]), "hello 65-byte clientVersion (decode)");
 }
 
 static void RunWelcomeCodecSmokeTests()
@@ -162,6 +185,26 @@ static void RunWelcomeCodecSmokeTests()
     ExpectProtocolException(() => WelcomePayloadCodec.Decode([..encoded, 0x00]), "welcome extra bytes");
     ExpectProtocolException(() => WelcomePayloadCodec.Encode(welcome with { SessionId = new byte[15] }), "welcome short sessionId (encode)");
     ExpectProtocolException(() => WelcomePayloadCodec.Encode(welcome with { Challenge = new byte[31] }), "welcome short challenge (encode)");
+
+    var oneByteName = new WelcomePayload("a", 1, 0, 1, new byte[16], true, new byte[32]);
+    var oneByteNameDecoded = WelcomePayloadCodec.Decode(WelcomePayloadCodec.Encode(oneByteName));
+    if (oneByteNameDecoded.ServerName != "a")
+        throw new Exception("WELCOME 1-byte serverName round-trip failed.");
+
+    var sixtyFourName = new WelcomePayload(new string('s', 64), 1, 0, 1, new byte[16], true, new byte[32]);
+    var sixtyFourNameDecoded = WelcomePayloadCodec.Decode(WelcomePayloadCodec.Encode(sixtyFourName));
+    if (sixtyFourNameDecoded.ServerName.Length != 64)
+        throw new Exception("WELCOME 64-byte serverName round-trip failed.");
+
+    var multiByteName = new WelcomePayload("é", 1, 0, 1, new byte[16], true, new byte[32]);
+    var multiByteNameBytes = WelcomePayloadCodec.Encode(multiByteName);
+    if (multiByteNameBytes[0] != 2)
+        throw new Exception("WELCOME serverName length must be UTF-8 byte count.");
+
+    ExpectProtocolException(() => WelcomePayloadCodec.Encode(new WelcomePayload("", 1, 0, 1, new byte[16], true, new byte[32])), "welcome empty serverName (encode)");
+    ExpectProtocolException(() => WelcomePayloadCodec.Encode(new WelcomePayload(new string('s', 65), 1, 0, 1, new byte[16], true, new byte[32])), "welcome 65-byte serverName (encode)");
+    ExpectProtocolException(() => WelcomePayloadCodec.Decode([0x00]), "welcome empty serverName (decode)");
+    ExpectProtocolException(() => WelcomePayloadCodec.Decode([0x41]), "welcome 65-byte serverName (decode)");
 
     var tamperedSession = new byte[encoded.Length - 1];
     Array.Copy(encoded, 0, tamperedSession, 0, 26);
@@ -217,18 +260,37 @@ static void RunAuthCodecSmokeTests()
     if (boundaryDecoded.Credential.Length != 255)
         throw new Exception("AUTH 255-byte credential boundary failed.");
 
+    var oneByteId = new AuthPayload(0x02, "", "d", new byte[32]);
+    var oneByteIdDecoded = AuthPayloadCodec.Decode(AuthPayloadCodec.Encode(oneByteId));
+    if (oneByteIdDecoded.DeviceId != "d")
+        throw new Exception("AUTH 1-byte deviceId round-trip failed.");
+
+    var sixtyFourId = new AuthPayload(0x02, "", new string('d', 64), new byte[32]);
+    var sixtyFourIdDecoded = AuthPayloadCodec.Decode(AuthPayloadCodec.Encode(sixtyFourId));
+    if (sixtyFourIdDecoded.DeviceId.Length != 64)
+        throw new Exception("AUTH 64-byte deviceId round-trip failed.");
+
+    var multiByteId = new AuthPayload(0x02, "", "dé", new byte[32]);
+    var multiByteIdBytes = AuthPayloadCodec.Encode(multiByteId);
+    if (multiByteIdBytes[1] != 0x00 || multiByteIdBytes[2] != 3)
+        throw new Exception("AUTH deviceId length must be UTF-8 byte count.");
+
     ExpectProtocolException(() => AuthPayloadCodec.Encode(new AuthPayload(0x03, "", "d", new byte[32])), "auth unknown credentialType (encode)");
     ExpectProtocolException(() => AuthPayloadCodec.Encode(new AuthPayload(0x01, "x", "d", new byte[32])), "auth token with non-empty credential (encode)");
     ExpectProtocolException(() => AuthPayloadCodec.Encode(new AuthPayload(0x02, "", "d", new byte[31])), "auth short challengeResponse (encode)");
     ExpectProtocolException(() => AuthPayloadCodec.Encode(new AuthPayload(0x02, new string('a', 256), "d", new byte[32])), "auth credential over 255 bytes (encode)");
+    ExpectProtocolException(() => AuthPayloadCodec.Encode(new AuthPayload(0x02, "", "", new byte[32])), "auth empty deviceId (encode)");
+    ExpectProtocolException(() => AuthPayloadCodec.Encode(new AuthPayload(0x02, "", new string('d', 65), new byte[32])), "auth 65-byte deviceId (encode)");
     ExpectProtocolException(() => AuthPayloadCodec.Decode(encoded[..^1]), "auth truncated");
     ExpectProtocolException(() => AuthPayloadCodec.Decode([..encoded, 0x00]), "auth extra bytes");
+    ExpectProtocolException(() => AuthPayloadCodec.Decode([0x02, 0x00, 0x00]), "auth empty deviceId (decode)");
+    ExpectProtocolException(() => AuthPayloadCodec.Decode([0x02, 0x00, 0x41]), "auth 65-byte deviceId (decode)");
 
     var badType = (byte[])encoded.Clone();
     badType[0] = 0x03;
     ExpectProtocolException(() => AuthPayloadCodec.Decode(badType), "auth unknown credentialType (decode)");
 
-    var badTokenCredential = new byte[] { 0x01, 0x01, 0x41, 0x00 }.Concat(new byte[32]).ToArray();
+    var badTokenCredential = new byte[] { 0x01, 0x01, 0x41, 0x01, 0x64 }.Concat(new byte[32]).ToArray();
     ExpectProtocolException(() => AuthPayloadCodec.Decode(badTokenCredential), "auth token credential length must be 0 (decode)");
 
     var badUtf8 = new byte[] { 0x02, 0x00, 0x01, 0xFF }.Concat(new byte[32]).ToArray();
@@ -241,7 +303,8 @@ static void RunAuthOkCodecSmokeTests()
         0x00,
         [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F],
         0x00000007,
-        "a1b2c3d4e5f60718");
+        [0x61, 0x31, 0x62, 0x32, 0x63, 0x33, 0x64, 0x34, 0x65, 0x35,
+         0x66, 0x36, 0x30, 0x37, 0x31, 0x38]);
     var encoded = AuthOkPayloadCodec.Encode(ok);
 
     byte[] expected =
@@ -261,10 +324,10 @@ static void RunAuthOkCodecSmokeTests()
     if (decoded.Result != ok.Result ||
         !decoded.SessionId.SequenceEqual(ok.SessionId) ||
         decoded.ServerCapabilities != ok.ServerCapabilities ||
-        decoded.NewToken != ok.NewToken)
+        !decoded.NewToken.SequenceEqual(ok.NewToken))
         throw new Exception("AUTH_OK round-trip failed.");
 
-    var noToken = new AuthOkPayload(0x00, new byte[16], 0x00000007, "");
+    var noToken = new AuthOkPayload(0x00, new byte[16], 0x00000007, []);
     var noTokenBytes = AuthOkPayloadCodec.Encode(noToken);
     if (noTokenBytes[^1] != 0x00)
         throw new Exception("AUTH_OK empty newToken must encode length 0.");
@@ -274,8 +337,20 @@ static void RunAuthOkCodecSmokeTests()
         noTokenDecoded.ServerCapabilities != noToken.ServerCapabilities)
         throw new Exception("AUTH_OK empty newToken round-trip failed.");
 
+    byte[] binaryToken = [0x00, 0x80, 0xFF, 0x10, 0xFE];
+    var binaryOk = new AuthOkPayload(0x00, new byte[16], 0x00000007, binaryToken);
+    var binaryDecoded = AuthOkPayloadCodec.Decode(AuthOkPayloadCodec.Encode(binaryOk));
+    if (!binaryDecoded.NewToken.SequenceEqual(binaryToken))
+        throw new Exception("AUTH_OK raw binary newToken round-trip failed.");
+
+    var maxToken = new AuthOkPayload(0x00, new byte[16], 0x00000007, new byte[255]);
+    var maxDecoded = AuthOkPayloadCodec.Decode(AuthOkPayloadCodec.Encode(maxToken));
+    if (maxDecoded.NewToken.Length != 255)
+        throw new Exception("AUTH_OK 255-byte newToken boundary failed.");
+
     ExpectProtocolException(() => AuthOkPayloadCodec.Encode(ok with { Result = 0x01 }), "auth_ok unknown result (encode)");
     ExpectProtocolException(() => AuthOkPayloadCodec.Encode(ok with { SessionId = new byte[15] }), "auth_ok short sessionId (encode)");
+    ExpectProtocolException(() => AuthOkPayloadCodec.Encode(new AuthOkPayload(0x00, new byte[16], 0x00000007, new byte[256])), "auth_ok newToken over 255 bytes (encode)");
     ExpectProtocolException(() => AuthOkPayloadCodec.Decode(encoded[..^1]), "auth_ok truncated");
     ExpectProtocolException(() => AuthOkPayloadCodec.Decode([..encoded, 0x00]), "auth_ok extra bytes");
 

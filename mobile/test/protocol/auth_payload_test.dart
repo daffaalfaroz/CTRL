@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+﻿import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ctrl_mobile/protocol/auth_denied_payload.dart';
@@ -72,7 +72,7 @@ void main() {
 
     test('rejects token auth with non-empty credential on decode', () {
       final bytes = <int>[
-        0x01, 0x01, 0x41, 0x00,
+        0x01, 0x01, 0x41, 0x01, 0x64,
         ...List.filled(32, 0),
       ];
       expect(
@@ -163,6 +163,80 @@ void main() {
         throwsA(isA<ProtocolException>()),
       );
     });
+
+    test('1-byte deviceId round-trips', () {
+      final payload = AuthPayload(
+        credentialType: authCredentialTypePairingCode,
+        credential: '123456',
+        deviceId: 'd',
+        challengeResponse: Uint8List(32),
+      );
+      expect(AuthPayloadCodec.decode(AuthPayloadCodec.encode(payload)), payload);
+    });
+
+    test('64-byte deviceId round-trips', () {
+      final payload = AuthPayload(
+        credentialType: authCredentialTypePairingCode,
+        credential: '123456',
+        deviceId: 'd' * 64,
+        challengeResponse: Uint8List(32),
+      );
+      expect(AuthPayloadCodec.decode(AuthPayloadCodec.encode(payload)), payload);
+    });
+
+    test('deviceId length uses UTF-8 byte count, not code points', () {
+      final bytes = AuthPayloadCodec.encode(
+        AuthPayload(
+          credentialType: authCredentialTypePairingCode,
+          credential: '',
+          deviceId: 'dé',
+          challengeResponse: Uint8List(32),
+        ),
+      );
+      expect(bytes.sublist(0, 3), [0x02, 0x00, 0x03]);
+    });
+
+    test('rejects empty deviceId on encode', () {
+      expect(
+        () => AuthPayloadCodec.encode(
+          AuthPayload(
+            credentialType: authCredentialTypePairingCode,
+            credential: '123456',
+            deviceId: '',
+            challengeResponse: Uint8List(32),
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte deviceId on encode', () {
+      expect(
+        () => AuthPayloadCodec.encode(
+          AuthPayload(
+            credentialType: authCredentialTypePairingCode,
+            credential: '123456',
+            deviceId: 'd' * 65,
+            challengeResponse: Uint8List(32),
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects empty deviceId on decode', () {
+      expect(
+        () => AuthPayloadCodec.decode([0x02, 0x00, 0x00]),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte deviceId length on decode', () {
+      expect(
+        () => AuthPayloadCodec.decode([0x02, 0x00, 0x41]),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
   });
 
   group('AuthOkPayloadCodec', () {
@@ -170,7 +244,10 @@ void main() {
       result: authOkResultOk,
       sessionId: Uint8List.fromList(List.generate(16, (i) => i)),
       serverCapabilities: 0x00000007,
-      newToken: 'a1b2c3d4e5f60718',
+      newToken: Uint8List.fromList([
+        0x61, 0x31, 0x62, 0x32, 0x63, 0x33, 0x64, 0x34, 0x65, 0x35,
+        0x66, 0x36, 0x30, 0x37, 0x31, 0x38,
+      ]),
     );
 
     test('encodes expected wire bytes from docs/protocol.md 19.4', () {
@@ -196,11 +273,51 @@ void main() {
         result: authOkResultOk,
         sessionId: Uint8List(16),
         serverCapabilities: 0x00000007,
-        newToken: '',
+        newToken: Uint8List(0),
       );
       final bytes = AuthOkPayloadCodec.encode(noToken);
       expect(bytes[bytes.length - 1], 0x00);
       expect(AuthOkPayloadCodec.decode(bytes), noToken);
+    });
+
+    test('round-trips raw binary newToken (non-UTF-8 bytes)', () {
+      final payload = AuthOkPayload(
+        result: authOkResultOk,
+        sessionId: Uint8List(16),
+        serverCapabilities: 0x00000007,
+        newToken: Uint8List.fromList([0x00, 0x80, 0xFF, 0x10, 0xFE]),
+      );
+      expect(
+        AuthOkPayloadCodec.decode(AuthOkPayloadCodec.encode(payload)),
+        payload,
+      );
+    });
+
+    test('255-byte newToken boundary round-trips', () {
+      final payload = AuthOkPayload(
+        result: authOkResultOk,
+        sessionId: Uint8List(16),
+        serverCapabilities: 0x00000007,
+        newToken: Uint8List(255),
+      );
+      expect(
+        AuthOkPayloadCodec.decode(AuthOkPayloadCodec.encode(payload)),
+        payload,
+      );
+    });
+
+    test('rejects newToken exceeding 255 bytes on encode', () {
+      expect(
+        () => AuthOkPayloadCodec.encode(
+          AuthOkPayload(
+            result: authOkResultOk,
+            sessionId: Uint8List(16),
+            serverCapabilities: 0x00000007,
+            newToken: Uint8List(256),
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
     });
 
     test('rejects sessionId that is not 16 bytes on encode', () {
@@ -210,7 +327,7 @@ void main() {
             result: authOkResultOk,
             sessionId: Uint8List(15),
             serverCapabilities: 0x00000007,
-            newToken: '',
+            newToken: Uint8List(0),
           ),
         ),
         throwsA(isA<ProtocolException>()),
@@ -245,7 +362,7 @@ void main() {
             result: 0x01,
             sessionId: Uint8List(16),
             serverCapabilities: 0x00000007,
-            newToken: '',
+            newToken: Uint8List(0),
           ),
         ),
         throwsA(isA<ProtocolException>()),

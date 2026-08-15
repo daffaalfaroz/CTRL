@@ -4,7 +4,7 @@ public sealed record AuthOkPayload(
     byte Result,
     byte[] SessionId,
     uint ServerCapabilities,
-    string NewToken);
+    byte[] NewToken);
 
 public static class AuthOkPayloadCodec
 {
@@ -16,12 +16,17 @@ public static class AuthOkPayloadCodec
             throw new ProtocolException("Unknown AUTH_OK result.");
         if (payload.SessionId is null || payload.SessionId.Length != 16)
             throw new ProtocolException("sessionId must be exactly 16 bytes.");
+        if (payload.NewToken is null)
+            throw new ProtocolException("newToken must not be null.");
+        if (payload.NewToken.Length > byte.MaxValue)
+            throw new ProtocolException("newToken must not exceed 255 bytes.");
 
         var writer = new PayloadWriter();
         writer.WriteUInt8(payload.Result);
         writer.WriteBytes(payload.SessionId);
         writer.WriteUInt32(payload.ServerCapabilities);
-        writer.WriteString(payload.NewToken);
+        writer.WriteUInt8((byte)payload.NewToken.Length);
+        writer.WriteBytes(payload.NewToken);
         return writer.ToArray();
     }
 
@@ -31,7 +36,8 @@ public static class AuthOkPayloadCodec
         var result = reader.ReadUInt8();
         var sessionId = reader.ReadBytes(16);
         var serverCapabilities = reader.ReadUInt32();
-        var newToken = reader.ReadString();
+        var newTokenLength = reader.ReadUInt8();
+        var newToken = reader.ReadBytes(newTokenLength);
         reader.ExpectEnd();
 
         if (result != ResultOk)

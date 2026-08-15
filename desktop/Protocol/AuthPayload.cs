@@ -24,7 +24,7 @@ public static class AuthPayloadCodec
         var writer = new PayloadWriter();
         writer.WriteUInt8(payload.CredentialType);
         writer.WriteString(payload.Credential);
-        writer.WriteString(payload.DeviceId);
+        writer.WriteString(payload.DeviceId, 1, 64);
         writer.WriteBytes(payload.ChallengeResponse);
         return writer.ToArray();
     }
@@ -34,7 +34,7 @@ public static class AuthPayloadCodec
         var reader = new PayloadReader(payload);
         var credentialType = reader.ReadUInt8();
         var credential = reader.ReadString();
-        var deviceId = reader.ReadString();
+        var deviceId = reader.ReadString(1, 64);
         var challengeResponse = reader.ReadBytes(32);
         reader.ExpectEnd();
 

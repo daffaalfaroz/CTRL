@@ -16,7 +16,7 @@ class AuthOkPayload {
   final int result;
   final Uint8List sessionId;
   final int serverCapabilities;
-  final String newToken;
+  final Uint8List newToken;
 
   @override
   bool operator ==(Object other) =>
@@ -24,14 +24,14 @@ class AuthOkPayload {
       result == other.result &&
       _bytesEqual(sessionId, other.sessionId) &&
       serverCapabilities == other.serverCapabilities &&
-      newToken == other.newToken;
+      _bytesEqual(newToken, other.newToken);
 
   @override
   int get hashCode => Object.hash(
         result,
         Object.hashAll(sessionId),
         serverCapabilities,
-        newToken,
+        Object.hashAll(newToken),
       );
 }
 
@@ -43,12 +43,16 @@ class AuthOkPayloadCodec {
     if (payload.sessionId.length != 16) {
       throw const ProtocolException('sessionId must be exactly 16 bytes.');
     }
+    if (payload.newToken.length > 0xFF) {
+      throw const ProtocolException('newToken must not exceed 255 bytes.');
+    }
 
     final writer = PayloadWriter()
       ..writeUInt8(payload.result)
       ..writeBytes(payload.sessionId)
       ..writeUInt32(payload.serverCapabilities)
-      ..writeString(payload.newToken);
+      ..writeUInt8(payload.newToken.length)
+      ..writeBytes(payload.newToken);
     return writer.toBytes();
   }
 
@@ -57,7 +61,8 @@ class AuthOkPayloadCodec {
     final result = reader.readUInt8();
     final sessionId = reader.readBytes(16);
     final serverCapabilities = reader.readUInt32();
-    final newToken = reader.readString();
+    final newTokenLength = reader.readUInt8();
+    final newToken = reader.readBytes(newTokenLength);
     reader.expectEnd();
 
     if (result != authOkResultOk) {
