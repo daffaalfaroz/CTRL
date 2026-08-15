@@ -134,6 +134,134 @@ void main() {
         throwsA(isA<ProtocolException>()),
       );
     });
+
+    test('1-byte deviceId and clientVersion round-trip', () {
+      const payload = HelloPayload(
+        deviceId: 'a',
+        clientVersion: 'b',
+        protocolMajor: 1,
+        protocolMinor: 0,
+        capabilities: 0x00000007,
+      );
+      expect(HelloPayloadCodec.decode(HelloPayloadCodec.encode(payload)),
+          payload);
+    });
+
+    test('64-byte deviceId and clientVersion round-trip', () {
+      final payload = HelloPayload(
+        deviceId: 'a' * 64,
+        clientVersion: 'b' * 64,
+        protocolMajor: 1,
+        protocolMinor: 0,
+        capabilities: 0x00000007,
+      );
+      expect(HelloPayloadCodec.decode(HelloPayloadCodec.encode(payload)),
+          payload);
+    });
+
+    test('deviceId length uses UTF-8 byte count, not code points', () {
+      const payload = HelloPayload(
+        deviceId: 'é',
+        clientVersion: 'c',
+        protocolMajor: 1,
+        protocolMinor: 0,
+        capabilities: 0x00000007,
+      );
+      final bytes = HelloPayloadCodec.encode(payload);
+      expect(bytes[0], 2);
+    });
+
+    test('rejects empty deviceId on encode', () {
+      expect(
+        () => HelloPayloadCodec.encode(
+          const HelloPayload(
+            deviceId: '',
+            clientVersion: '0.1.0',
+            protocolMajor: 1,
+            protocolMinor: 0,
+            capabilities: 0x00000007,
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte deviceId on encode', () {
+      expect(
+        () => HelloPayloadCodec.encode(
+          HelloPayload(
+            deviceId: 'a' * 65,
+            clientVersion: '0.1.0',
+            protocolMajor: 1,
+            protocolMinor: 0,
+            capabilities: 0x00000007,
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects empty clientVersion on encode', () {
+      expect(
+        () => HelloPayloadCodec.encode(
+          const HelloPayload(
+            deviceId: 'ctrl-42a8',
+            clientVersion: '',
+            protocolMajor: 1,
+            protocolMinor: 0,
+            capabilities: 0x00000007,
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte clientVersion on encode', () {
+      expect(
+        () => HelloPayloadCodec.encode(
+          HelloPayload(
+            deviceId: 'ctrl-42a8',
+            clientVersion: 'c' * 65,
+            protocolMajor: 1,
+            protocolMinor: 0,
+            capabilities: 0x00000007,
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects empty deviceId on decode', () {
+      expect(
+        () => HelloPayloadCodec.decode([0x00]),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte deviceId length on decode', () {
+      expect(
+        () => HelloPayloadCodec.decode([0x41]),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects empty clientVersion on decode', () {
+      expect(
+        () => HelloPayloadCodec.decode([
+          0x09, 0x63, 0x74, 0x72, 0x6C, 0x2D, 0x34, 0x32, 0x61, 0x38, 0x00,
+        ]),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte clientVersion length on decode', () {
+      expect(
+        () => HelloPayloadCodec.decode([
+          0x09, 0x63, 0x74, 0x72, 0x6C, 0x2D, 0x34, 0x32, 0x61, 0x38, 0x41,
+        ]),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
   });
 
   group('WelcomePayloadCodec', () {
@@ -238,6 +366,96 @@ void main() {
       encoded[27] = 0x02;
       expect(
         () => WelcomePayloadCodec.decode(encoded),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('1-byte serverName round-trips', () {
+      final payload = WelcomePayload(
+        serverName: 'a',
+        effectiveMajor: 1,
+        effectiveMinor: 0,
+        minSupportedMajor: 1,
+        sessionId: Uint8List(16),
+        authRequired: true,
+        challenge: Uint8List(32),
+      );
+      expect(WelcomePayloadCodec.decode(WelcomePayloadCodec.encode(payload)),
+          payload);
+    });
+
+    test('64-byte serverName round-trips', () {
+      final payload = WelcomePayload(
+        serverName: 's' * 64,
+        effectiveMajor: 1,
+        effectiveMinor: 0,
+        minSupportedMajor: 1,
+        sessionId: Uint8List(16),
+        authRequired: true,
+        challenge: Uint8List(32),
+      );
+      expect(WelcomePayloadCodec.decode(WelcomePayloadCodec.encode(payload)),
+          payload);
+    });
+
+    test('serverName length uses UTF-8 byte count, not code points', () {
+      final payload = WelcomePayload(
+        serverName: 'é',
+        effectiveMajor: 1,
+        effectiveMinor: 0,
+        minSupportedMajor: 1,
+        sessionId: Uint8List(16),
+        authRequired: true,
+        challenge: Uint8List(32),
+      );
+      final bytes = WelcomePayloadCodec.encode(payload);
+      expect(bytes[0], 2);
+    });
+
+    test('rejects empty serverName on encode', () {
+      expect(
+        () => WelcomePayloadCodec.encode(
+          WelcomePayload(
+            serverName: '',
+            effectiveMajor: 1,
+            effectiveMinor: 0,
+            minSupportedMajor: 1,
+            sessionId: Uint8List(16),
+            authRequired: true,
+            challenge: Uint8List(32),
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte serverName on encode', () {
+      expect(
+        () => WelcomePayloadCodec.encode(
+          WelcomePayload(
+            serverName: 's' * 65,
+            effectiveMajor: 1,
+            effectiveMinor: 0,
+            minSupportedMajor: 1,
+            sessionId: Uint8List(16),
+            authRequired: true,
+            challenge: Uint8List(32),
+          ),
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects empty serverName on decode', () {
+      expect(
+        () => WelcomePayloadCodec.decode([0x00]),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
+    test('rejects 65-byte serverName length on decode', () {
+      expect(
+        () => WelcomePayloadCodec.decode([0x41]),
         throwsA(isA<ProtocolException>()),
       );
     });

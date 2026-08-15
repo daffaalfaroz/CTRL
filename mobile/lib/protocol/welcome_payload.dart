@@ -55,7 +55,7 @@ class WelcomePayloadCodec {
     }
 
     final writer = PayloadWriter()
-      ..writeString(payload.serverName)
+      ..writeString(payload.serverName, minLength: 1, maxLength: 64)
       ..writeUInt8(payload.effectiveMajor)
       ..writeUInt8(payload.effectiveMinor)
       ..writeUInt8(payload.minSupportedMajor)
@@ -67,7 +67,7 @@ class WelcomePayloadCodec {
 
   static WelcomePayload decode(List<int> bytes) {
     final reader = PayloadReader(bytes);
-    final serverName = reader.readString();
+    final serverName = reader.readString(minLength: 1, maxLength: 64);
     final effectiveMajor = reader.readUInt8();
     final effectiveMinor = reader.readUInt8();
     final minSupportedMajor = reader.readUInt8();

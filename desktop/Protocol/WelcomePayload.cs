@@ -19,7 +19,7 @@ public static class WelcomePayloadCodec
             throw new ProtocolException("challenge must be exactly 32 bytes.");
 
         var writer = new PayloadWriter();
-        writer.WriteString(payload.ServerName);
+        writer.WriteString(payload.ServerName, 1, 64);
         writer.WriteUInt8(payload.EffectiveMajor);
         writer.WriteUInt8(payload.EffectiveMinor);
         writer.WriteUInt8(payload.MinSupportedMajor);
@@ -32,7 +32,7 @@ public static class WelcomePayloadCodec
     public static WelcomePayload Decode(byte[] payload)
     {
         var reader = new PayloadReader(payload);
-        var serverName = reader.ReadString();
+        var serverName = reader.ReadString(1, 64);
         var effectiveMajor = reader.ReadUInt8();
         var effectiveMinor = reader.ReadUInt8();
         var minSupportedMajor = reader.ReadUInt8();

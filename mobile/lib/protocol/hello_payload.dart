@@ -39,8 +39,8 @@ class HelloPayload {
 class HelloPayloadCodec {
   static Uint8List encode(HelloPayload payload) {
     final writer = PayloadWriter()
-      ..writeString(payload.deviceId)
-      ..writeString(payload.clientVersion)
+      ..writeString(payload.deviceId, minLength: 1, maxLength: 64)
+      ..writeString(payload.clientVersion, minLength: 1, maxLength: 64)
       ..writeUInt8(payload.protocolMajor)
       ..writeUInt8(payload.protocolMinor)
       ..writeUInt32(payload.capabilities);
@@ -50,8 +50,8 @@ class HelloPayloadCodec {
   static HelloPayload decode(List<int> bytes) {
     final reader = PayloadReader(bytes);
     final result = HelloPayload(
-      deviceId: reader.readString(),
-      clientVersion: reader.readString(),
+      deviceId: reader.readString(minLength: 1, maxLength: 64),
+      clientVersion: reader.readString(minLength: 1, maxLength: 64),
       protocolMajor: reader.readUInt8(),
       protocolMinor: reader.readUInt8(),
       capabilities: reader.readUInt32(),

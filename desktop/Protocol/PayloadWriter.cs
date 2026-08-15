@@ -39,13 +39,13 @@ public sealed class PayloadWriter
             _bytes.Add(b);
     }
 
-    public void WriteString(string value)
+    public void WriteString(string value, int minLength = 0, int maxLength = byte.MaxValue)
     {
         if (value is null)
             throw new ArgumentNullException(nameof(value));
         var bytes = StrictUtf8.GetBytes(value);
-        if (bytes.Length > byte.MaxValue)
-            throw new ProtocolException("String exceeds 255 UTF-8 bytes.");
+        if (bytes.Length < minLength || bytes.Length > maxLength)
+            throw new ProtocolException($"String must be {minLength}-{maxLength} UTF-8 bytes.");
         _bytes.Add((byte)bytes.Length);
         _bytes.AddRange(bytes);
     }

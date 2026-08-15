@@ -49,10 +49,11 @@ class PayloadWriter {
     _bytes.addAll(bytes);
   }
 
-  void writeString(String value) {
+  void writeString(String value, {int minLength = 0, int maxLength = 0xFF}) {
     final bytes = utf8.encode(value);
-    if (bytes.length > 0xFF) {
-      throw const ProtocolException('String exceeds 255 UTF-8 bytes.');
+    if (bytes.length < minLength || bytes.length > maxLength) {
+      throw ProtocolException(
+          'String must be $minLength-$maxLength UTF-8 bytes.');
     }
     _bytes
       ..add(bytes.length)
@@ -123,7 +124,14 @@ class PayloadReader {
     return result;
   }
 
-  String readString() => readStringOfLength(readUInt8());
+  String readString({int minLength = 0, int maxLength = 0xFF}) {
+    final length = readUInt8();
+    if (length < minLength || length > maxLength) {
+      throw ProtocolException(
+          'String must be $minLength-$maxLength UTF-8 bytes.');
+    }
+    return readStringOfLength(length);
+  }
 
   String readStringOfLength(int length) {
     _require(length);
