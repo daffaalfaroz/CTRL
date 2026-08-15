@@ -51,13 +51,25 @@ void main() {
     );
   });
 
-  test('rejects reserved flags', () {
+  test('decode tolerates reserved flags but encode rejects them (D2)', () {
     final bytes = Uint8List(ProtocolFrame.headerSize);
     bytes[0] = 0x43;
     bytes[1] = 0x54;
     bytes[4] = FrameCodec.secure;
+    final decoded = FrameCodec.decode(bytes);
+    expect(decoded.flags & FrameCodec.reservedFlagsMask, isNot(0));
+
+    final frame = ProtocolFrame(
+      versionMajor: 1,
+      versionMinor: 0,
+      flags: FrameCodec.secure,
+      messageType: 0x01,
+      sequence: 0,
+      timestamp: 0,
+      payload: Uint8List(0),
+    );
     expect(
-      () => FrameCodec.decode(bytes),
+      () => FrameCodec.encode(frame),
       throwsA(isA<ProtocolException>()),
     );
   });
