@@ -706,11 +706,18 @@ Panjang payload = 1 + 1 + 11 = 13 (0x0D).
 | Panjang `deviceId` | 1–64 byte |
 | Panjang `profileId` | 36 byte (UUID ASCII; lihat §24.15) |
 | Panjang `clientVersion`/`serverName` | 1–64 byte |
-| Panjang kredensial | token tersimpan 32–512 (tidak dikirim); kode pairing 6 digit ATAU payload QR ≤ 512 (dikirim) |
+| Panjang kredensial (AUTH) | token tersimpan 32–512 byte (batas storage/internal, TIDAK dikirim); kode pairing/payload QR yang dikirim ≤ 255 byte (dibatasi `credentialLength` 1 byte) |
+| Panjang `newToken` (AUTH_OK) | ≤ 255 byte yang dikirim via wire (dibatasi `newTokenLength` 1 byte); token tersimpan 32–512 byte (batas storage/internal) |
 | Panjang `challenge`/`challengeResponse` | tetap 32 byte |
 | Panjang JSON (PROFILE_LIST/CONFIG_PUSH/STATUS) | ≤ 65 535 (dibatasi max payload); chunking reserved untuk minor |
 | Entri INPUT_SNAPSHOT | 1–1024 |
 | Panjang pesan ERROR | ≤ 1024 byte |
+
+Batas storage/internal dan batas wire TIDAK sama. Field `credentialLength`
+(AUTH) dan `newTokenLength` (AUTH_OK) masing-masing 1 byte, sehingga payload
+yang dikirim lewat wire maksimal 255 byte. Token persisten disimpan 32–512 byte
+secara internal namun TIDAK pernah dikirim lewat wire (AUTH token memakai
+`credentialLength=0`).
 
 Penerima TIDAK boleh mengalokasikan buffer berdasarkan nilai panjang sebelum
 memvalidasi batas. Payload > 65 535 tidak dapat direpresentasikan header;
