@@ -9,7 +9,9 @@ import 'package:ctrl_mobile/protocol/disconnect_payload.dart';
 import 'package:ctrl_mobile/protocol/error_payload.dart';
 import 'package:ctrl_mobile/protocol/frame.dart';
 import 'package:ctrl_mobile/protocol/hello_payload.dart';
+import 'package:ctrl_mobile/protocol/heartbeat_payload.dart';
 import 'package:ctrl_mobile/protocol/input_event.dart';
+import 'package:ctrl_mobile/protocol/input_event_payload.dart';
 import 'package:ctrl_mobile/protocol/input_reset_payload.dart';
 import 'package:ctrl_mobile/protocol/input_snapshot_payload.dart';
 import 'package:ctrl_mobile/protocol/message_types.dart';
@@ -81,6 +83,20 @@ void main() {
       expect(inbound.isMonotonic(40000), isFalse, reason: 'jump over 0x7FFF');
       expect(inbound.isMonotonic(40001), isTrue);
     });
+
+    test('outbound wraps 65535 -> 0 (M1.4.3)', () {
+      final outbound = SequenceTracker(start: 65534);
+      expect(outbound.next(), 65534);
+      expect(outbound.next(), 65535);
+      expect(outbound.next(), 0);
+      expect(outbound.next(), 1);
+
+      final inbound = InboundSequenceTracker();
+      expect(inbound.isMonotonic(65534), isTrue);
+      expect(inbound.isMonotonic(65535), isTrue);
+      expect(inbound.isMonotonic(0), isTrue, reason: 'wrap 65535 -> 0 accepted');
+      expect(inbound.isMonotonic(1), isTrue);
+    });
   });
 
   group('AckTracker', () {
@@ -98,6 +114,21 @@ void main() {
       expect(tracker.failed(), [10]);
     });
 
+    test('retransmit reschedules the deadline without resetting attempts (M1.4.3)',
+        () {
+      var now = 0;
+      final tracker = AckTracker(nowMs: () => now, timeoutMs: 3000);
+      tracker.track(10);
+      now = 3000;
+      expect(tracker.retryExpired(), [10], reason: 'first timeout');
+      now = 4000;
+      tracker.reschedule(10); // retransmit at t=4000
+      now = 6999;
+      expect(tracker.failed(), isEmpty, reason: 'no fail before retry deadline');
+      now = 7000;
+      expect(tracker.failed(), [10], reason: 'fail after retry deadline');
+    });
+
     test('ack clears pending state', () {
       final tracker = AckTracker(nowMs: () => 0, timeoutMs: 3000);
       tracker.track(20);
@@ -108,7 +139,7 @@ void main() {
   });
 
   group('ClientSession handshake', () {
-    test('HELLO(seq0) -> WELCOME -> AUTH(seq1) -> AUTH_OK -> snapshot(seq2)',
+    test('HELLO(seq0) -> WELCOME -> AUTH(seq1) -> AUTH_OK -> snapshot(seq0 reset)',
         () async {
       final fake = FakeTransport();
       final listener = RecordingListener();
@@ -137,7 +168,8 @@ void main() {
       expect(session.state, ClientSessionState.ready);
       expect(fake.sentFrames.length, 3);
       expect(fake.sentFrames[2].messageType, MessageType.inputSnapshot);
-      expect(fake.sentFrames[2].sequence, 2);
+      expect(fake.sentFrames[2].sequence, 0,
+          reason: '§7/§24.5: sequence restarts at 0 after AUTH_OK');
     });
 
     test('AUTH_OK with mismatched sessionId answers ERROR invalid-message',
@@ -333,6 +365,386 @@ void main() {
     });
   });
 
+  group('ClientSession state transitions', () {
+    test('connect passes through connecting -> connected -> waitWelcome', () {
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener);
+      session.connect();
+      expect(listener.states, [
+        ClientSessionState.connecting,
+        ClientSessionState.connected,
+        ClientSessionState.waitWelcome,
+      ]);
+      expect(session.state, ClientSessionState.waitWelcome);
+    });
+
+    test('WELCOME advances waitWelcome -> waitAuth -> waitAuthOk', () async {
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener);
+      session.connect();
+      await session.waitForIdle();
+      fake.emit(_frame(MessageType.welcome, WelcomePayloadCodec.encode(welcome())));
+      await session.waitForIdle();
+      expect(listener.states, [
+        ClientSessionState.connecting,
+        ClientSessionState.connected,
+        ClientSessionState.waitWelcome,
+        ClientSessionState.waitAuth,
+        ClientSessionState.waitAuthOk,
+      ]);
+      expect(session.state, ClientSessionState.waitAuthOk);
+      expect(fake.sentFrames.last.messageType, MessageType.auth);
+    });
+
+    test('reconnect passes through connecting -> connected -> waitWelcome', () async {
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener);
+      await _toReady(session, fake);
+      listener.states.clear();
+      fake.emitDisconnected('peer closed');
+      expect(session.state, ClientSessionState.reconnecting);
+      fake.isConnected = true;
+      session.reconnect();
+      expect(listener.states, [
+        ClientSessionState.reconnecting,
+        ClientSessionState.connecting,
+        ClientSessionState.connected,
+        ClientSessionState.waitWelcome,
+      ]);
+    });
+  });
+
+  group('ClientSession outbound (M1.4.3)', () {
+    test('sendInputEvent is guarded before ready', () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener());
+      session.connect();
+      await session.waitForIdle();
+      expect(
+        () => session.sendInputEvent(_buttonEvent()),
+        throwsStateError,
+      );
+    });
+
+    test('sendInputEvent sends a single INPUT_EVENT after ready', () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener());
+      await _toReady(session, fake);
+      session.sendInputEvent(_buttonEvent());
+      await session.waitForIdle();
+      expect(fake.sentFrames.last.messageType, MessageType.inputEvent);
+      expect(fake.sentFrames.last.sequence, 1,
+          reason: 'snapshot reset the counter to 0; event follows at 1');
+      final decoded =
+          InputEventPayloadCodec.decode(fake.sentFrames.last.payload);
+      expect(decoded.event.controlId, 'btn-fire');
+      expect(decoded.event.state, inputEventStateDown);
+      expect(decoded.event.pressCount, 1);
+    });
+
+    test('sendHeartbeat is guarded before ready', () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener());
+      session.connect();
+      await session.waitForIdle();
+      expect(() => session.sendHeartbeat(), throwsStateError);
+    });
+
+    test('sendHeartbeat sends HEARTBEAT carrying clientSendTime', () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener(), nowMs: () => 4242);
+      await _toReady(session, fake);
+      session.sendHeartbeat();
+      await session.waitForIdle();
+      expect(fake.sentFrames.last.messageType, MessageType.heartbeat);
+      expect(
+        HeartbeatPayloadCodec.decode(fake.sentFrames.last.payload).clientSendTime,
+        4242,
+      );
+    });
+
+    test('sendWithAck retries once (same sequence) then closes on final timeout',
+        () async {
+      var now = 0;
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener, nowMs: () => now);
+      await _toReady(session, fake);
+      session.sendWithAck(
+        type: MessageType.inputReset,
+        payload: InputResetPayloadCodec.encode(
+            InputResetPayload(reason: inputResetReasonStateReset)),
+      );
+      await session.waitForIdle();
+      final seq = fake.sentFrames.last.sequence;
+      expect(fake.sentFrames.last.flags & FrameCodec.ackRequested, FrameCodec.ackRequested);
+
+      now = 3000;
+      session.processPendingAcks();
+      await session.waitForIdle();
+      expect(listener.errors.join(), contains('Retransmitting'));
+      expect(fake.sentFrames.last.sequence, seq, reason: 'retry reuses sequence');
+
+      now = 6000;
+      session.processPendingAcks();
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.disconnected,
+          reason: 'final timeout closes the session');
+    });
+
+    test('ACK for an unknown/wrong sequence is a harmless no-op', () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener(), nowMs: () => 0);
+      await _toReady(session, fake);
+      session.sendWithAck(
+        type: MessageType.inputReset,
+        payload: InputResetPayloadCodec.encode(
+            InputResetPayload(reason: inputResetReasonStateReset)),
+      );
+      await session.waitForIdle();
+      final seq = fake.sentFrames.last.sequence;
+      fake.emit(_frame(
+        MessageType.ack,
+        AckPayloadCodec.encode(AckPayload(ackedSequence: seq + 1, ackTime: 0)),
+      ));
+      fake.emit(_frame(
+        MessageType.ack,
+        AckPayloadCodec.encode(AckPayload(ackedSequence: seq + 1, ackTime: 0)),
+      ));
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.ready);
+    });
+
+    test('sendDisconnect sends DISCONNECT then closes', () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener());
+      await _toReady(session, fake);
+      await session.sendDisconnect(reason: disconnectReasonNormal);
+      expect(fake.sentFrames.last.messageType, MessageType.disconnect);
+      expect(
+        DisconnectPayloadCodec.decode(fake.sentFrames.last.payload).reason,
+        disconnectReasonNormal,
+      );
+      expect(session.state, ClientSessionState.disconnected);
+    });
+
+    test('normal ACK clears pending without retry (M1.4.3)', () async {
+      var now = 0;
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener, nowMs: () => now);
+      await _toReady(session, fake);
+      session.sendWithAck(
+        type: MessageType.inputReset,
+        payload: InputResetPayloadCodec.encode(
+            InputResetPayload(reason: inputResetReasonStateReset)),
+      );
+      await session.waitForIdle();
+      final seq = fake.sentFrames.last.sequence;
+      final framesBefore = fake.sentFrames.length;
+      fake.emit(_frame(
+        MessageType.ack,
+        AckPayloadCodec.encode(AckPayload(ackedSequence: seq, ackTime: 1)),
+        sequence: 5,
+      ));
+      await session.waitForIdle();
+      now = 3000;
+      session.processPendingAcks();
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.ready,
+          reason: 'ACKed message must not fail the session');
+      expect(listener.errors.join(), isNot(contains('Retransmitting')));
+      expect(fake.sentFrames.length, framesBefore,
+          reason: 'no retransmit may follow a normal ACK');
+    });
+
+    test('duplicate ACK for the same sequence is harmless (M1.4.3)', () async {
+      var now = 0;
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener, nowMs: () => now);
+      await _toReady(session, fake);
+      session.sendWithAck(
+        type: MessageType.inputReset,
+        payload: InputResetPayloadCodec.encode(
+            InputResetPayload(reason: inputResetReasonStateReset)),
+      );
+      await session.waitForIdle();
+      final seq = fake.sentFrames.last.sequence;
+      fake.emit(_frame(
+        MessageType.ack,
+        AckPayloadCodec.encode(AckPayload(ackedSequence: seq, ackTime: 1)),
+        sequence: 5,
+      ));
+      fake.emit(_frame(
+        MessageType.ack,
+        AckPayloadCodec.encode(AckPayload(ackedSequence: seq, ackTime: 2)),
+        sequence: 6,
+      ));
+      await session.waitForIdle();
+      now = 6000;
+      session.processPendingAcks();
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.ready,
+          reason: 'duplicate ACKs must not corrupt tracker state');
+    });
+
+    test('late ACK after the final timeout cannot resurrect the session',
+        () async {
+      var now = 0;
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener, nowMs: () => now);
+      await _toReady(session, fake);
+      session.sendWithAck(
+        type: MessageType.inputReset,
+        payload: InputResetPayloadCodec.encode(
+            InputResetPayload(reason: inputResetReasonStateReset)),
+      );
+      await session.waitForIdle();
+      final seq = fake.sentFrames.last.sequence;
+      final framesBefore = fake.sentFrames.length;
+
+      now = 3000;
+      session.processPendingAcks(); // retry once
+      await session.waitForIdle();
+      now = 6000;
+      session.processPendingAcks(); // final timeout
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.disconnected);
+
+      fake.emit(_frame(
+        MessageType.ack,
+        AckPayloadCodec.encode(AckPayload(ackedSequence: seq, ackTime: 9)),
+        sequence: 7,
+      ));
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.disconnected,
+          reason: 'a late ACK must not reopen a closed session');
+      expect(fake.sentFrames.length, framesBefore + 1,
+          reason: 'only the retransmit was added; the late ACK sends nothing');
+    });
+  });
+
+  group('ClientSession sequence boundary (M1.4.3)', () {
+    test('outbound counter restarts at 0 after AUTH_OK and increments',
+        () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener());
+      await _toReady(session, fake);
+      expect(fake.sentFrames[2].sequence, 0,
+          reason: '§7/§24.5: INPUT_SNAPSHOT is the first post-AUTH_OK message');
+      session.sendHeartbeat();
+      await session.waitForIdle();
+      expect(fake.sentFrames.last.sequence, 1);
+      session.sendInputEvent(_buttonEvent());
+      await session.waitForIdle();
+      expect(fake.sentFrames.last.sequence, 2);
+    });
+
+    test('inbound tracker resets at AUTH_OK so PONG seq 0 raises no anomaly',
+        () async {
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener);
+      session.connect();
+      await session.waitForIdle();
+      fake.emit(_frame(
+          MessageType.welcome, WelcomePayloadCodec.encode(welcome()),
+          sequence: 0));
+      await session.waitForIdle();
+      fake.emit(
+          _frame(MessageType.authOk, AuthOkPayloadCodec.encode(authOk()),
+              sequence: 1));
+      await session.waitForIdle();
+      // The server->client direction restarts at 0 after AUTH_OK.
+      fake.emit(_frame(
+          MessageType.pong,
+          PongPayloadCodec.encode(
+              PongPayload(clientSendTime: 7, serverTime: 8)),
+          sequence: 0));
+      await session.waitForIdle();
+      expect(listener.pongs.length, 1);
+      expect(listener.pongs.first.clientSendTime, 7,
+          reason: 'PONG must echo clientSendTime (§10)');
+      expect(
+        listener.errors.where((e) => e.contains('Non-monotonic')),
+        isEmpty,
+        reason: 'inbound tracker must be reset at the AUTH_OK boundary',
+      );
+    });
+
+    test('reconnect restarts the post-AUTH_OK counter from 0', () async {
+      final fake = FakeTransport();
+      final session = newSession(fake, RecordingListener());
+      await _toReady(session, fake);
+      expect(fake.sentFrames[2].sequence, 0);
+
+      fake.emitDisconnected('peer closed');
+      fake.isConnected = true;
+      session.reconnect();
+      await session.waitForIdle();
+      fake.emit(
+          _frame(MessageType.welcome, WelcomePayloadCodec.encode(welcome())));
+      await session.waitForIdle();
+      fake.emit(
+          _frame(MessageType.authOk, AuthOkPayloadCodec.encode(authOk())));
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.ready);
+      expect(fake.sentFrames.last.messageType, MessageType.inputSnapshot);
+      expect(fake.sentFrames.last.sequence, 0,
+          reason: 'a fresh post-AUTH_OK counter after reconnect');
+    });
+  });
+
+  group('ClientSession snapshot boundary (M1.4.3)', () {
+    test('first app-plane message after AUTH_OK is the snapshot with initial flag',
+        () async {
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = ClientSession(
+        transport: fake,
+        authenticator: EchoAuthenticator(
+          credentialType: authCredentialTypeToken,
+          credential: '',
+          deviceId: deviceId,
+        ),
+        listener: listener,
+        inputSnapshotProvider: _InitialFlagSnapshotProvider(),
+      );
+      await _toReady(session, fake);
+      final snapshot = fake.sentFrames[2];
+      expect(snapshot.messageType, MessageType.inputSnapshot);
+      final payload =
+          InputSnapshotPayloadCodec.decode(snapshot.payload);
+      expect(payload.events[0].flags & inputEventFlagInitial, inputEventFlagInitial,
+          reason: 'snapshot entries must carry the initial flag (§15)');
+    });
+
+    test('reconnect re-sends the snapshot after AUTH_OK', () async {
+      final fake = FakeTransport();
+      final listener = RecordingListener();
+      final session = newSession(fake, listener);
+      await _toReady(session, fake);
+      expect(fake.sentFrames[2].messageType, MessageType.inputSnapshot);
+
+      fake.emitDisconnected('peer closed');
+      fake.isConnected = true;
+      session.reconnect();
+      await session.waitForIdle();
+      fake.emit(_frame(MessageType.welcome, WelcomePayloadCodec.encode(welcome())));
+      await session.waitForIdle();
+      fake.emit(_frame(MessageType.authOk, AuthOkPayloadCodec.encode(authOk())));
+      await session.waitForIdle();
+      expect(session.state, ClientSessionState.ready);
+      expect(fake.sentFrames.last.messageType, MessageType.inputSnapshot,
+          reason: 'reconnect must resync via snapshot (§13/§15)');
+    });
+  });
+
   group('ClientSession error paths', () {
     test('reserved flags answer ERROR forbidden and close (D2)', () async {
       final fake = FakeTransport();
@@ -463,6 +875,29 @@ class _FixedSnapshotProvider implements InputSnapshotProvider {
   InputSnapshotPayload currentSnapshot() => snapshot;
 }
 
+class _InitialFlagSnapshotProvider implements InputSnapshotProvider {
+  final InputSnapshotPayload snapshot = InputSnapshotPayload(events: [
+    InputEvent(
+      controlId: 'a',
+      kind: inputEventKindButton,
+      flags: inputEventFlagStateChanged | inputEventFlagInitial,
+      state: inputEventStateDown,
+      pressCount: 1,
+    ),
+  ]);
+
+  @override
+  InputSnapshotPayload currentSnapshot() => snapshot;
+}
+
+InputEvent _buttonEvent() => InputEvent(
+      controlId: 'btn-fire',
+      kind: inputEventKindButton,
+      flags: inputEventFlagStateChanged,
+      state: inputEventStateDown,
+      pressCount: 1,
+    );
+
 class FakeTransport implements TransportConnection {
   final _frames = StreamController<ProtocolFrame>.broadcast(sync: true);
   final _disconnected = StreamController<String>.broadcast(sync: true);
@@ -477,7 +912,11 @@ class FakeTransport implements TransportConnection {
   @override
   Stream<String> get disconnected => _disconnected.stream;
 
-  void emit(ProtocolFrame frame) => _frames.add(frame);
+  void emit(ProtocolFrame frame) {
+    if (!_frames.isClosed) {
+      _frames.add(frame);
+    }
+  }
 
   void emitDisconnected(String reason) => _disconnected.add(reason);
 

@@ -10,6 +10,9 @@ import '../protocol/error_payload.dart';
 import '../protocol/frame.dart';
 import '../protocol/frame_builder.dart';
 import '../protocol/hello_payload.dart';
+import '../protocol/heartbeat_payload.dart';
+import '../protocol/input_event.dart';
+import '../protocol/input_event_payload.dart';
 import '../protocol/input_reset_payload.dart';
 import '../protocol/input_snapshot_payload.dart';
 import '../protocol/message_types.dart';
@@ -53,7 +56,7 @@ class ClientSession {
   final int Function() nowMs;
 
   SequenceTracker _outbound = SequenceTracker();
-  final InboundSequenceTracker _inbound = InboundSequenceTracker();
+  InboundSequenceTracker _inbound = InboundSequenceTracker();
   late AckTracker _ackTracker;
   final Map<int, _PendingSend> _pendingSends = <int, _PendingSend>{};
   Future<void> _sendTail = Future<void>.value();
@@ -86,6 +89,7 @@ class ClientSession {
 
     _framesSub = transport.frames.listen(_onFrame);
     _disconnectedSub = transport.disconnected.listen(_onDisconnected);
+    _setState(ClientSessionState.connecting);
     _setState(ClientSessionState.connected);
     _enqueueHello();
   }
@@ -110,6 +114,7 @@ class ClientSession {
 
     _framesSub = transport.frames.listen(_onFrame);
     _disconnectedSub = transport.disconnected.listen(_onDisconnected);
+    _setState(ClientSessionState.connecting);
     _setState(ClientSessionState.connected);
     _enqueueHello();
   }
@@ -143,6 +148,63 @@ class ClientSession {
           'Message sequence $sequence unacknowledged after retry; session unhealthy.');
       _closeDeliberate();
     }
+  }
+
+  /// Sends one input event on the hot path. Only allowed while READY; before
+  /// authentication the protocol forbids application-plane messages (§3).
+  void sendInputEvent(InputEvent event) {
+    if (_state != ClientSessionState.ready) {
+      throw StateError('sendInputEvent() requires the ready state ($_state).');
+    }
+    _enqueue(
+      type: MessageType.inputEvent,
+      payload: InputEventPayloadCodec.encode(InputEventPayload(event: event)),
+    );
+  }
+
+  /// Sends a HEARTBEAT carrying the current clientSendTime (docs/protocol.md
+  /// §10; client interval 1000 ms). The periodic timer is deferred (D7) — the
+  /// caller drives this, which keeps tests deterministic.
+  void sendHeartbeat() {
+    if (_state != ClientSessionState.ready) {
+      throw StateError('sendHeartbeat() requires the ready state ($_state).');
+    }
+    _enqueue(
+      type: MessageType.heartbeat,
+      payload:
+          HeartbeatPayloadCodec.encode(HeartbeatPayload(clientSendTime: nowMs())),
+    );
+  }
+
+  /// Sends a control-plane message that requests an ACK (docs/protocol.md §11,
+  /// e.g. CONFIG_PUSH). The ACK is tracked with retry-once semantics.
+  void sendWithAck({required int type, required Uint8List payload}) {
+    if (_state != ClientSessionState.ready) {
+      throw StateError('sendWithAck() requires the ready state ($_state).');
+    }
+    _enqueue(
+      type: type,
+      payload: payload,
+      mustUnderstand: true,
+      ackRequested: true,
+    );
+  }
+
+  /// Graceful teardown (§14): sends DISCONNECT, waits for the frame to flush,
+  /// then closes the session.
+  Future<void> sendDisconnect({int reason = disconnectReasonNormal}) async {
+    if (_state == ClientSessionState.closed ||
+        _state == ClientSessionState.disconnected) {
+      return;
+    }
+    _enqueue(
+      type: MessageType.disconnect,
+      payload:
+          DisconnectPayloadCodec.encode(DisconnectPayload(reason: reason)),
+      mustUnderstand: true,
+    );
+    await waitForIdle();
+    await _closeDeliberate();
   }
 
   void _enqueueHello() {
@@ -251,6 +313,7 @@ class ClientSession {
 
     _effectiveMajor = welcome.effectiveMajor;
     _welcomeSessionId = Uint8List.fromList(welcome.sessionId);
+    _setState(ClientSessionState.waitAuth);
 
     if (!welcome.authRequired) {
       // Not needed in v1 (D6: server always requires auth), but keep the branch.
@@ -293,6 +356,10 @@ class ClientSession {
   }
 
   void _becomeReady() {
+    // docs/protocol.md §7/§24.5: the per-direction sequence counter starts
+    // from 0 exactly after AUTH_OK — reset both directions at this boundary.
+    _outbound = SequenceTracker();
+    _inbound = InboundSequenceTracker();
     _setState(ClientSessionState.ready);
     _enqueueSnapshot();
   }
@@ -451,8 +518,26 @@ class ClientSession {
     required Uint8List payload,
     bool mustUnderstand = false,
     bool ackRequested = false,
+    bool trackAck = true,
   }) {
-    final sequence = _outbound.next();
+    _enqueueWithSequence(
+      _outbound.next(),
+      type: type,
+      payload: payload,
+      mustUnderstand: mustUnderstand,
+      ackRequested: ackRequested,
+      trackAck: trackAck,
+    );
+  }
+
+  void _enqueueWithSequence(
+    int sequence, {
+    required int type,
+    required Uint8List payload,
+    bool mustUnderstand = false,
+    bool ackRequested = false,
+    bool trackAck = true,
+  }) {
     final bytes = FrameBuilder.build(
       messageType: type,
       payload: payload,
@@ -464,7 +549,7 @@ class ClientSession {
       timestamp: nowMs(),
     );
 
-    if (ackRequested) {
+    if (ackRequested && trackAck) {
       _ackTracker.track(sequence);
       _pendingSends[sequence] =
           _PendingSend(type: type, payload: payload, mustUnderstand: mustUnderstand);
@@ -479,12 +564,18 @@ class ClientSession {
       return;
     }
     listener.onError('Retransmitting sequence $sequence after ACK timeout.');
-    _enqueue(
+    // Re-send the SAME sequence with ACK_REQUESTED but do NOT re-track: the
+    // pending entry keeps its attempt count so the retry fires once and the
+    // next deadline triggers failure (docs/protocol.md §7).
+    _enqueueWithSequence(
+      sequence,
       type: pending.type,
       payload: pending.payload,
       mustUnderstand: pending.mustUnderstand,
       ackRequested: true,
+      trackAck: false,
     );
+    _ackTracker.reschedule(sequence);
   }
 
   Future<void> _transportSend(Uint8List bytes) async {

@@ -1,7 +1,10 @@
-/// Continuous per-direction sequence counter (D1: no reset after AUTH_OK, per
-/// docs/protocol.md §19). Wraps modulo 2^16.
+/// Per-direction outbound sequence counter (docs/protocol.md §7). Starts at 0
+/// (or a seeded value for wrap tests); the session installs a fresh tracker at
+/// the AUTH_OK boundary (§24.5) and values wrap modulo 2^16.
 class SequenceTracker {
-  int _next = 0;
+  int _next;
+
+  SequenceTracker({int start = 0}) : _next = start & 0xFFFF;
 
   int next() {
     final value = _next;
