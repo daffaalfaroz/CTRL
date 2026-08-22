@@ -22,6 +22,15 @@ class AckTracker {
 
   void acknowledge(int sequence) => _pending.remove(sequence);
 
+  /// Resets the deadline of a pending sequence after a retransmit, keeping its
+  /// attempt count so the retry fires exactly once (§7).
+  void reschedule(int sequence) {
+    final pending = _pending[sequence];
+    if (pending != null) {
+      pending.sentAtMs = nowMs();
+    }
+  }
+
   bool isPending(int sequence) => _pending.containsKey(sequence);
 
   /// Sequences whose first deadline passed and still await an ACK. Each call

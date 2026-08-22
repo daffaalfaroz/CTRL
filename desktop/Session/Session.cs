@@ -12,6 +12,12 @@ public sealed class SessionOptions
     public uint ServerCapabilities { get; init; } = 0x00000007;
     public bool AuthRequired { get; init; } = true;
     public ulong AckTimeoutMs { get; init; } = 3000;
+
+    /// <summary>Server-side heartbeat timeout (docs/protocol.md §10): the
+    /// connection is considered dead when READY and no frame arrives for this
+    /// long. The client heartbeats every 1000 ms, so 3000 ms ≈ 3 misses.</summary>
+    public ulong HeartbeatTimeoutMs { get; init; } = 3000;
+
     public Func<ulong> NowMs { get; init; } = () => (ulong)Environment.TickCount64;
     public Func<byte[]>? SessionIdFactory { get; init; }
     public Func<byte[]>? ChallengeFactory { get; init; }
@@ -31,8 +37,8 @@ public sealed class Session
     private readonly ISessionListener _listener;
     private readonly IInputStateFlusher? _flusher;
     private readonly SessionOptions _options;
-    private readonly SequenceTracker _outbound = new();
-    private readonly InboundSequenceTracker _inbound = new();
+    private SequenceTracker _outbound = new();
+    private InboundSequenceTracker _inbound = new();
     private readonly AckTracker _ackTracker;
     private readonly Dictionary<ushort, (byte Type, byte[] Payload, bool MustUnderstand)> _pendingSends = new();
 
@@ -42,6 +48,7 @@ public sealed class Session
     private byte _effectiveMajor;
     private string _deviceId = "";
     private int _closedFlag;
+    private ulong _lastActivityMs;
 
     /// <summary>Raised when the session reaches Ready (authenticated).</summary>
     public event Action<Session>? Authenticated;
@@ -65,6 +72,7 @@ public sealed class Session
         _effectiveMajor = options.ProtocolMajor;
         _sessionId = (options.SessionIdFactory ?? NewSessionId)();
         _challenge = (options.ChallengeFactory ?? NewChallenge)();
+        _lastActivityMs = options.NowMs();
 
         SetState(ServerSessionState.WaitHello);
         _connection.FrameReceived += OnFrameReceived;
@@ -74,6 +82,10 @@ public sealed class Session
     public ServerSessionState State => _state;
     public string DeviceId => _deviceId;
     public byte[] SessionId => _sessionId;
+
+    /// <summary>Number of outbound messages still awaiting an ACK. Test hook
+    /// proving e.g. PONG/HEARTBEAT never enter the ACK tracker (§10/§11).</summary>
+    public int PendingAckCount => _ackTracker.PendingCount;
 
     /// <summary>
     /// Simulates a keepalive/ACK timer tick: retries each pending message once
@@ -111,8 +123,40 @@ public sealed class Session
         Close(ServerSessionState.Closing, "Session taken over by a new connection.");
     }
 
+    /// <summary>
+    /// Marks the session as active at the given time. Called automatically on
+    /// every received frame; exposed so the host loop can drive it on a fake
+    /// clock in deterministic tests.
+    /// </summary>
+    public void Touch(ulong nowMs) => _lastActivityMs = nowMs;
+
+    /// <summary>
+    /// Heartbeat liveness check (docs/protocol.md §10): when READY and no frame
+    /// has arrived within <see cref="SessionOptions.HeartbeatTimeoutMs"/>, the
+    /// connection is marked dead — close + flush. Runs on the injected clock so
+    /// tests drive it directly instead of sleeping.
+    /// </summary>
+    public bool CheckHeartbeatTimeout()
+    {
+        if (_state != ServerSessionState.Ready)
+            return false;
+        if (_options.NowMs() - _lastActivityMs < _options.HeartbeatTimeoutMs)
+            return false;
+        Close(ServerSessionState.Closing, "Heartbeat timeout.");
+        return true;
+    }
+
+    /// <summary>
+    /// Sends a control-plane message that requests an ACK (docs/protocol.md §11,
+    /// e.g. CONFIG_PUSH). The ACK is tracked with retry-once semantics; used by
+    /// the ACK lifecycle tests and the cross-language integration harness.
+    /// </summary>
+    public void SendWithAck(byte messageType, byte[] payload) =>
+        Send(messageType, payload, mustUnderstand: true, ackRequested: true);
+
     private void OnFrameReceived(ProtocolFrame frame)
     {
+        _lastActivityMs = _options.NowMs();
         try
         {
             ProcessFrame(frame);
@@ -256,6 +300,10 @@ public sealed class Session
             _options.ServerCapabilities,
             result.NewToken ?? Array.Empty<byte>());
         Send(MessageType.AuthOk, AuthOkPayloadCodec.Encode(authOk), mustUnderstand: true);
+        // docs/protocol.md §7/§24.5: the per-direction sequence counter starts
+        // from 0 exactly after AUTH_OK — reset both directions at this boundary.
+        _outbound = new SequenceTracker();
+        _inbound = new InboundSequenceTracker();
         SetState(ServerSessionState.Ready);
         Authenticated?.Invoke(this);
     }
@@ -399,13 +447,14 @@ public sealed class Session
     }
 
     private void SendWithSequence(
-        ushort sequence, byte type, byte[] payload, bool mustUnderstand, bool ackRequested = false)
+        ushort sequence, byte type, byte[] payload, bool mustUnderstand,
+        bool ackRequested = false, bool trackAck = true)
     {
         var bytes = FrameBuilder.Build(
             type, payload, sequence, ackRequested, mustUnderstand,
             _effectiveMajor, _options.ProtocolMinor, _options.NowMs());
 
-        if (ackRequested)
+        if (ackRequested && trackAck)
         {
             _ackTracker.Track(sequence);
             _pendingSends[sequence] = (type, payload, mustUnderstand);
@@ -419,7 +468,12 @@ public sealed class Session
         if (!_pendingSends.TryGetValue(sequence, out var pending))
             return;
         _listener.OnError($"Retransmitting sequence {sequence} after ACK timeout.");
-        SendWithSequence(sequence, pending.Type, pending.Payload, pending.MustUnderstand, ackRequested: true);
+        // Re-send the same sequence with ACK_REQUESTED but do NOT re-track:
+        // the pending entry keeps its attempt count so the retry fires once and
+        // the next deadline triggers failure (docs/protocol.md §7).
+        SendWithSequence(sequence, pending.Type, pending.Payload, pending.MustUnderstand,
+            ackRequested: true, trackAck: false);
+        _ackTracker.Reschedule(sequence);
     }
 
     private async Task SendSafeAsync(byte[] bytes)

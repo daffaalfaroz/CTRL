@@ -32,6 +32,14 @@ public sealed class AckTracker
 
     public void Acknowledge(ushort sequence) => _pending.Remove(sequence);
 
+    /// <summary>Resets the deadline of a pending sequence after a retransmit,
+    /// keeping its attempt count so the retry fires exactly once (§7).</summary>
+    public void Reschedule(ushort sequence)
+    {
+        if (_pending.TryGetValue(sequence, out var pending))
+            pending.SentAtMs = _nowMs();
+    }
+
     public bool IsPending(ushort sequence) => _pending.ContainsKey(sequence);
 
     /// <summary>

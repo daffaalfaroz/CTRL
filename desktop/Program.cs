@@ -5,6 +5,12 @@ using CTRL.Desktop.Protocol;
 using CTRL.Desktop.Session;
 using CTRL.Desktop.Transport;
 
+if (args.Length >= 1 && args[0] == "--integration")
+{
+    var port = args.Length >= 2 && int.TryParse(args[1], out var p) ? p : 0;
+    return await RunIntegrationServerAsync(port);
+}
+
 RunFrameCodecSmokeTests();
 RunPayloadPrimitiveSmokeTests();
 RunHelloCodecSmokeTests();
@@ -36,9 +42,18 @@ RunSessionAckSmokeTests();
 RunSessionAuthDeniedSmokeTests();
 RunSessionTakeoverSmokeTests();
 await RunSessionLoopbackHostSmokeTests();
+RunSequenceWrapSmokeTests();
+RunSessionStateTransitionSmokeTests();
+RunSessionAckLifecycleSmokeTests();
+RunSessionHeartbeatTimeoutSmokeTests();
+RunSessionDisconnectFlushSmokeTests();
+RunSessionSnapshotBoundarySmokeTests();
+RunSessionSequenceBoundarySmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
+Console.WriteLine("M1.4.3 session integration hardening smoke tests passed.");
+return 0;
 
 static void RunFrameCodecSmokeTests()
 {
@@ -1045,7 +1060,7 @@ static void RunSessionHandshakeSmokeTests()
     Assert(session.State == ServerSessionState.WaitAuth, "state must advance to WaitAuth");
     Assert(conn.SentFrames.Count == 1, "server must send WELCOME");
     Assert(conn.SentFrames[0].MessageType == MessageType.Welcome, "first outbound must be WELCOME");
-    Assert(conn.SentFrames[0].Sequence == 0, "WELCOME sequence must be 0 (D1)");
+    Assert(conn.SentFrames[0].Sequence == 0, "WELCOME sequence must be 0 (handshake numbering)");
     var welcome = WelcomePayloadCodec.Decode(conn.SentFrames[0].Payload);
     Assert(welcome.AuthRequired, "authRequired must be true (D6)");
     Assert(welcome.SessionId.SequenceEqual(TestData.SessionId), "sessionId must be server-issued");
@@ -1058,7 +1073,7 @@ static void RunSessionHandshakeSmokeTests()
     Assert(session.State == ServerSessionState.Ready, "state must advance to Ready");
     Assert(conn.SentFrames.Count == 2, "server must send AUTH_OK");
     Assert(conn.SentFrames[1].MessageType == MessageType.AuthOk, "second outbound must be AUTH_OK");
-    Assert(conn.SentFrames[1].Sequence == 1, "AUTH_OK sequence must be 1 (D1 continuous)");
+    Assert(conn.SentFrames[1].Sequence == 1, "AUTH_OK sequence must be 1 (handshake numbering)");
     var authOk = AuthOkPayloadCodec.Decode(conn.SentFrames[1].Payload);
     Assert(authOk.SessionId.SequenceEqual(welcome.SessionId), "AUTH_OK must echo sessionId");
     Assert(authOk.NewToken.Length == 0, "token auth must not issue a newToken");
@@ -1323,12 +1338,359 @@ static async Task RunSessionLoopbackHostSmokeTests()
     Console.WriteLine("M1.4.2: loopback SessionHost smoke tests passed.");
 }
 
+static void RunSequenceWrapSmokeTests()
+{
+    var outbound = new SequenceTracker(65534);
+    Assert(outbound.Next() == 65534, "wrap seed start");
+    Assert(outbound.Next() == 65535, "wrap reaches max");
+    Assert(outbound.Next() == 0, "wrap 65535 -> 0");
+    Assert(outbound.Next() == 1, "wrap continues after 0");
+
+    var inbound = new InboundSequenceTracker();
+    Assert(inbound.IsMonotonic(65534), "wrap first");
+    Assert(inbound.IsMonotonic(65535), "wrap second");
+    Assert(inbound.IsMonotonic(0), "wrap 65535 -> 0 accepted");
+    Assert(inbound.IsMonotonic(1), "wrap continues");
+
+    Console.WriteLine("M1.4.3: sequence wrap smoke tests passed.");
+}
+
+static void RunSessionStateTransitionSmokeTests()
+{
+    var (s1, c1, l1, f1) = CreateSession();
+    Assert(s1.State == ServerSessionState.WaitHello, "server starts at WaitHello");
+    c1.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    Assert(s1.State == ServerSessionState.WaitAuth, "WaitHello -> WaitAuth");
+    c1.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", TestData.Challenge)),
+        1, mustUnderstand: true));
+    Assert(s1.State == ServerSessionState.Ready, "WaitAuth -> Ready");
+    Assert(l1.States.SequenceEqual(new[]
+        {
+            ServerSessionState.WaitHello,
+            ServerSessionState.WaitAuth,
+            ServerSessionState.Ready
+        }),
+        "listener must observe the exact server state sequence");
+
+    // App-plane INPUT_EVENT between WELCOME and AUTH -> not-authenticated.
+    var (s2, c2, l2, f2) = CreateSession();
+    c2.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    c2.Emit(MakeFrame(MessageType.InputEvent,
+        InputEventPayloadCodec.Encode(new InputEventPayload(new InputEvent("a", 0, 0, State: 1, PressCount: 1))),
+        1));
+    Assert(c2.SentFrames[^1].MessageType == MessageType.Error,
+        "INPUT_EVENT pre-AUTH_OK must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(c2.SentFrames[^1].Payload).Code == ErrorPayloadCodec.CodeNotAuthenticated,
+        "INPUT_EVENT pre-AUTH_OK must be ERROR not-authenticated");
+    Assert(s2.State == ServerSessionState.Closed, "session must close after pre-auth input");
+
+    // App-plane INPUT_SNAPSHOT before HELLO -> not-authenticated too.
+    var (s3, c3, l3, f3) = CreateSession();
+    c3.Emit(MakeFrame(MessageType.InputSnapshot,
+        InputSnapshotPayloadCodec.Encode(new InputSnapshotPayload(new List<InputEvent>
+        {
+            new("a", 0, 0, State: 1, PressCount: 1)
+        })),
+        0));
+    Assert(c3.SentFrames[^1].MessageType == MessageType.Error,
+        "INPUT_SNAPSHOT pre-AUTH_OK must produce ERROR");
+    Assert(ErrorPayloadCodec.Decode(c3.SentFrames[^1].Payload).Code == ErrorPayloadCodec.CodeNotAuthenticated,
+        "INPUT_SNAPSHOT pre-AUTH_OK must be ERROR not-authenticated");
+    Assert(s3.State == ServerSessionState.Closed, "session must close after pre-auth snapshot");
+
+    Console.WriteLine("M1.4.3: session state-transition smoke tests passed.");
+}
+
+static void RunSessionAckLifecycleSmokeTests()
+{
+    var clock = new MutableClock { Value = 1000 };
+
+    // Normal: server sends an ACK-requested message, client ACKs, no retry.
+    var (s1, c1, l1, f1) = CreateSession(nowProvider: clock.Now);
+    DoHandshake(s1, c1);
+    s1.SendWithAck(MessageType.InputReset, InputResetPayloadCodec.Encode(new InputResetPayload(0)));
+    var sent = c1.SentFrames[^1];
+    Assert(sent.MessageType == MessageType.InputReset && (sent.Flags & FrameCodec.AckRequested) != 0,
+        "SendWithAck must set ACK_REQUESTED");
+    var ackSeq = sent.Sequence;
+    c1.Emit(MakeFrame(MessageType.Ack, AckPayloadCodec.Encode(new AckPayload(ackSeq, clock.Value)), 100));
+    var before1 = c1.SentFrames.Count;
+    clock.Value += 3000;
+    s1.ProcessPendingAcks();
+    Assert(c1.SentFrames.Count == before1, "ACKed sequence must not retransmit");
+    Assert(s1.State == ServerSessionState.Ready, "session stays up after ACK");
+
+    // Wrong-sequence ACK: no-op, pending stays and retry still happens.
+    var (s2, c2, l2, f2) = CreateSession(nowProvider: clock.Now);
+    DoHandshake(s2, c2);
+    s2.SendWithAck(MessageType.InputReset, InputResetPayloadCodec.Encode(new InputResetPayload(0)));
+    var pendingSeq = c2.SentFrames[^1].Sequence;
+    c2.Emit(MakeFrame(MessageType.Ack, AckPayloadCodec.Encode(new AckPayload((ushort)(pendingSeq + 1), clock.Value)), 100));
+    var before2 = c2.SentFrames.Count;
+    clock.Value += 3000;
+    s2.ProcessPendingAcks();
+    Assert(c2.SentFrames.Count == before2 + 1, "wrong-seq ACK must not prevent retry");
+    Assert(c2.SentFrames[^1].Sequence == pendingSeq, "retransmit must reuse the same sequence");
+
+    // ACK after retry clears pending and stops further retries.
+    c2.Emit(MakeFrame(MessageType.Ack, AckPayloadCodec.Encode(new AckPayload(pendingSeq, clock.Value)), 101));
+    var before3 = c2.SentFrames.Count;
+    clock.Value += 3000;
+    s2.ProcessPendingAcks();
+    Assert(c2.SentFrames.Count == before3, "ACK after retry must stop further retries");
+    Assert(s2.State == ServerSessionState.Ready, "session stays up after ACK-after-retry");
+
+    // Duplicate ACK: harmless.
+    var (s5, c5, l5, f5) = CreateSession(nowProvider: clock.Now);
+    DoHandshake(s5, c5);
+    s5.SendWithAck(MessageType.InputReset, InputResetPayloadCodec.Encode(new InputResetPayload(0)));
+    var seq5 = c5.SentFrames[^1].Sequence;
+    c5.Emit(MakeFrame(MessageType.Ack, AckPayloadCodec.Encode(new AckPayload(seq5, clock.Value)), 200));
+    c5.Emit(MakeFrame(MessageType.Ack, AckPayloadCodec.Encode(new AckPayload(seq5, clock.Value)), 201));
+    Assert(s5.State == ServerSessionState.Ready, "duplicate ACK must be harmless");
+
+    // Final timeout after retry: session closes + flush.
+    var (s3, c3, l3, f3) = CreateSession(nowProvider: clock.Now);
+    DoHandshake(s3, c3);
+    s3.SendWithAck(MessageType.InputReset, InputResetPayloadCodec.Encode(new InputResetPayload(0)));
+    var seq3 = c3.SentFrames[^1].Sequence;
+    clock.Value += 3000;
+    s3.ProcessPendingAcks(); // retry once
+    Assert(c3.SentFrames[^1].Sequence == seq3, "first retry reuses sequence");
+    clock.Value += 3000;
+    s3.ProcessPendingAcks(); // final timeout
+    Assert(s3.State == ServerSessionState.Closed, "session must close after final ACK timeout");
+    Assert(f3.FlushCount == 1, "close after final ACK timeout must flush");
+
+    Console.WriteLine("M1.4.3: session ACK lifecycle smoke tests passed.");
+}
+
+static void RunSessionHeartbeatTimeoutSmokeTests()
+{
+    var clock = new MutableClock { Value = 0 };
+    var (s1, c1, l1, f1) = CreateSession(nowProvider: clock.Now);
+    DoHandshake(s1, c1); // heartbeat liveness only applies when READY
+    Assert(!s1.CheckHeartbeatTimeout(), "no timeout at t=0");
+
+    clock.Value = 2999;
+    Assert(!s1.CheckHeartbeatTimeout(), "no timeout before 3000ms");
+
+    // Incoming HEARTBEAT extends liveness.
+    c1.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(42)), 2));
+    Assert(c1.SentFrames[^1].MessageType == MessageType.Pong, "server must reply PONG to HEARTBEAT");
+    Assert((c1.SentFrames[^1].Flags & FrameCodec.AckRequested) == 0,
+        "PONG must not use ACK_REQUESTED (docs/protocol.md §10)");
+    Assert(s1.PendingAckCount == 0, "PONG must not enter the ACK tracker");
+
+    clock.Value = 2999 + 2999;
+    Assert(!s1.CheckHeartbeatTimeout(), "heartbeat must extend liveness");
+    clock.Value = 5999;
+    Assert(s1.CheckHeartbeatTimeout(), "3s without activity must time out");
+    Assert(s1.State == ServerSessionState.Closed, "heartbeat timeout must close the session");
+    Assert(f1.FlushCount == 1, "heartbeat timeout must flush pending inputs");
+    Assert(!s1.CheckHeartbeatTimeout(), "timeout check must be a no-op once closed");
+
+    // Non-READY sessions must not be killed by the heartbeat check.
+    var clock2 = new MutableClock { Value = 0 };
+    var (s2, c2, l2, f2) = CreateSession(nowProvider: clock2.Now);
+    clock2.Value = 10_000;
+    Assert(!s2.CheckHeartbeatTimeout(), "handshake sessions must be exempt from heartbeat timeout");
+
+    Console.WriteLine("M1.4.3: session heartbeat-timeout smoke tests passed.");
+}
+
+static void RunSessionDisconnectFlushSmokeTests()
+{
+    // Graceful DISCONNECT.
+    var (s1, c1, l1, f1) = CreateSession();
+    DoHandshake(s1, c1);
+    c1.Emit(MakeFrame(MessageType.Disconnect, DisconnectPayloadCodec.Encode(new DisconnectPayload(0)), 2, mustUnderstand: true));
+    Assert(s1.State == ServerSessionState.Closed, "graceful DISCONNECT closes");
+    Assert(f1.FlushCount == 1, "graceful DISCONNECT flushes exactly once");
+
+    // Ungraceful TCP close.
+    var (s2, c2, l2, f2) = CreateSession();
+    DoHandshake(s2, c2);
+    c2.EmitDisconnected("peer closed");
+    Assert(s2.State == ServerSessionState.Closed, "TCP close closes");
+    Assert(f2.FlushCount == 1, "TCP close flushes exactly once");
+
+    // Protocol violation (out-of-state control plane).
+    var (s3, c3, l3, f3) = CreateSession();
+    DoHandshake(s3, c3);
+    c3.Emit(MakeFrame(MessageType.Auth, new byte[] { 0x00 }, 3, mustUnderstand: true));
+    Assert(s3.State == ServerSessionState.Closed, "protocol violation closes");
+    Assert(f3.FlushCount == 1, "protocol violation flushes exactly once");
+
+    // Auth failure.
+    var (s4, c4, l4, f4) = CreateSession();
+    c4.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var w4 = WelcomePayloadCodec.Decode(c4.SentFrames[^1].Payload);
+    c4.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x02, "wrong", "ctrl-42a8", w4.Challenge)),
+        1, mustUnderstand: true));
+    Assert(s4.State == ServerSessionState.Closed, "auth failure closes");
+    Assert(f4.FlushCount == 1, "auth failure flushes exactly once");
+
+    // Flush must be idempotent: a late disconnect must not flush again.
+    c4.EmitDisconnected("late close");
+    Assert(f4.FlushCount == 1, "flush must run exactly once even with a late disconnect");
+
+    Console.WriteLine("M1.4.3: session disconnect-flush smoke tests passed.");
+}
+
+static void RunSessionSnapshotBoundarySmokeTests()
+{
+    var initial = new InputEvent("btn-fire", InputEventCodec.KindButton,
+        InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial,
+        State: InputEventCodec.StateDown, PressCount: 5);
+    var snapshot = new InputSnapshotPayload(new List<InputEvent> { initial });
+
+    var (s1, c1, l1, f1) = HandshakeToReady();
+    c1.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(snapshot), 2));
+    Assert(l1.Snapshots.Count == 1, "snapshot after AUTH_OK must be delivered");
+    Assert((l1.Snapshots[0].Events[0].Flags & InputEventCodec.FlagInitial) != 0,
+        "snapshot entry must preserve the initial flag (docs/protocol.md §15)");
+
+    // Reconnect scenario: new session on the same device takes over; the old
+    // one is closed + flushed and the new one carries its own snapshot.
+    var manager = new SessionManager();
+    var trustedRe = new AuthenticatorStub(["ctrl-re"]);
+    var (sA, cA, lA, fA) = CreateSession(authenticator: trustedRe);
+    manager.Register(sA);
+    DoHandshake(sA, cA, "ctrl-re");
+    cA.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(snapshot), 2));
+    Assert(lA.Snapshots.Count == 1, "first session snapshot delivered");
+
+    var (sB, cB, lB, fB) = CreateSession(authenticator: trustedRe);
+    manager.Register(sB);
+    DoHandshake(sB, cB, "ctrl-re");
+    Assert(sA.State == ServerSessionState.Closed, "reconnect takes over old session (D3)");
+    Assert(fA.FlushCount == 1, "reconnect flushes old session inputs");
+    cB.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(snapshot), 2));
+    Assert(lB.Snapshots.Count == 1, "new session snapshot delivered");
+
+    Console.WriteLine("M1.4.3: session snapshot-boundary smoke tests passed.");
+}
+
+static void RunSessionSequenceBoundarySmokeTests()
+{
+    static InputSnapshotPayload EmptySnapshot() =>
+        new(new List<InputEvent>
+        {
+            new("a", InputEventCodec.KindButton, 0, State: 0, PressCount: 0)
+        });
+
+    // Outbound: the first server message after AUTH_OK must carry sequence 0
+    // (docs/protocol.md §7/§24.5), then increment per message.
+    var (s1, c1, l1, f1) = CreateSession();
+    DoHandshake(s1, c1);
+    c1.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(42)), 0));
+    Assert(c1.SentFrames[^1].MessageType == MessageType.Pong, "server must answer HEARTBEAT with PONG");
+    Assert(c1.SentFrames[^1].Sequence == 0, "post-AUTH_OK outbound sequence must restart at 0");
+    c1.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(43)), 1));
+    Assert(c1.SentFrames[^1].Sequence == 1, "post-AUTH_OK outbound sequence must increment");
+
+    // Inbound: the client restarts at 0 too; the tracker must not flag the
+    // AUTH_OK(seq 1) -> snapshot(seq 0) transition as non-monotonic.
+    var (s2, c2, l2, f2) = HandshakeToReady();
+    c2.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(EmptySnapshot()), 0));
+    Assert(l2.Snapshots.Count == 1, "snapshot carrying the reset sequence must be delivered");
+    Assert(!l2.Errors.Any(e => e.Contains("Non-monotonic")),
+        "inbound tracker must be reset at the AUTH_OK boundary");
+
+    // Inbound wrap across 65535 -> 0 is accepted (modulo 2^16).
+    var (s3, c3, l3, f3) = HandshakeToReady();
+    c3.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(EmptySnapshot()), 65535));
+    c3.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(EmptySnapshot()), 0));
+    Assert(l3.Snapshots.Count == 2, "snapshot after wrap must be delivered");
+    Assert(!l3.Errors.Any(e => e.Contains("Non-monotonic")),
+        "65535 -> 0 must be accepted as monotonic (wrap)");
+
+    // Per-direction independence: inbound numbering does not disturb the
+    // outbound counter and vice versa.
+    var (s4, c4, l4, f4) = CreateSession();
+    DoHandshake(s4, c4);
+    c4.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(1)), 100));
+    c4.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(2)), 101));
+    Assert(c4.SentFrames[^1].Sequence == 1,
+        "outbound counter must be independent of inbound numbering");
+
+    // A fresh session never inherits a previous session's counter.
+    var (s5, c5, l5, f5) = CreateSession();
+    DoHandshake(s5, c5);
+    c5.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(9)), 0));
+    Assert(c5.SentFrames[^1].Sequence == 0, "a new session starts its counters from scratch");
+
+    Console.WriteLine("M1.4.3: session sequence-boundary smoke tests passed.");
+}
+
+static async Task<int> RunIntegrationServerAsync(int port)
+{
+    var server = new TcpServer(port);
+    var manager = new SessionManager();
+    var listener = new IntegrationListener();
+    var flusher = new IntegrationFlusher();
+    var options = new SessionOptions
+    {
+        SessionIdFactory = () => TestData.SessionId,
+        ChallengeFactory = () => TestData.Challenge,
+    };
+
+    server.ClientConnected += connection =>
+    {
+        var recording = new RecordingTransportConnection(connection);
+        var session = new Session(
+            recording,
+            new AuthenticatorStub(["integration-device"], "123456"),
+            listener,
+            options,
+            flusher);
+        session.Authenticated += s =>
+        {
+            Console.WriteLine($"C#:AUTHENTICATED:{s.DeviceId}");
+            Console.Out.Flush();
+        };
+        session.Closed += s =>
+        {
+            Console.WriteLine($"C#:CLOSED:{s.DeviceId}");
+            Console.Out.Flush();
+        };
+        manager.Register(session);
+        return Task.CompletedTask;
+    };
+
+    _ = server.StartAsync();
+    await WaitUntil(() => server.LocalPort >= 0);
+    Console.WriteLine($"C#:LISTENING:{server.LocalPort}");
+    Console.Out.Flush();
+
+    // Drive the server from stdin: any line other than STOP is ignored; EOF or
+    // STOP stops the listener and exits (the Dart integration tool sends STOP).
+    while (true)
+    {
+        var line = Console.ReadLine();
+        if (line == null || line.Trim() == "STOP")
+            break;
+    }
+
+    await server.StopAsync();
+    return 0;
+}
+
 static byte[] MakeFrame(byte type, byte[] payload, ushort sequence = 0,
     bool ackRequested = false, bool mustUnderstand = false, byte major = 1, ulong timestamp = 0)
     => FrameBuilder.Build(type, payload, sequence, ackRequested, mustUnderstand, major, 0, timestamp);
 
 static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlusher) CreateSession(
-    ulong now = 0, IAuthenticator? authenticator = null)
+    ulong now = 0, IAuthenticator? authenticator = null, Func<ulong>? nowProvider = null)
 {
     var connection = new FakeTransportConnection();
     var listener = new RecordingSessionListener();
@@ -1339,12 +1701,26 @@ static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlu
         listener,
         new SessionOptions
         {
-            NowMs = () => now,
+            NowMs = nowProvider ?? (() => now),
             SessionIdFactory = () => TestData.SessionId,
             ChallengeFactory = () => TestData.Challenge,
         },
         flusher);
     return (session, connection, listener, flusher);
+}
+
+static WelcomePayload DoHandshake(Session session, FakeTransportConnection conn, string deviceId = "ctrl-42a8")
+{
+    conn.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload(deviceId, "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var welcome = WelcomePayloadCodec.Decode(conn.SentFrames[^1].Payload);
+    conn.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", deviceId, welcome.Challenge)),
+        1, mustUnderstand: true));
+    if (session.State != ServerSessionState.Ready)
+        throw new Exception("DoHandshake: session did not reach Ready.");
+    return welcome;
 }
 
 static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlusher) HandshakeToReady(
@@ -1457,4 +1833,128 @@ sealed class RecordingFlusher : IInputStateFlusher
 {
     public int FlushCount { get; private set; }
     public void Flush() => FlushCount++;
+}
+
+/// <summary>Mutable fake clock so session tests can advance time deterministically.</summary>
+sealed class MutableClock
+{
+    public ulong Value;
+    public ulong Now() => Value;
+}
+
+static class IntegrationLog
+{
+    public static string Name(byte type) => type switch
+    {
+        MessageType.Hello => "HELLO",
+        MessageType.Welcome => "WELCOME",
+        MessageType.Auth => "AUTH",
+        MessageType.AuthOk => "AUTH_OK",
+        MessageType.AuthDenied => "AUTH_DENIED",
+        MessageType.InputEvent => "INPUT_EVENT",
+        MessageType.InputSnapshot => "INPUT_SNAPSHOT",
+        MessageType.InputReset => "INPUT_RESET",
+        MessageType.Heartbeat => "HEARTBEAT",
+        MessageType.Pong => "PONG",
+        MessageType.Ack => "ACK",
+        MessageType.Error => "ERROR",
+        MessageType.Disconnect => "DISCONNECT",
+        MessageType.ProfileListReq => "PROFILE_LIST_REQ",
+        MessageType.ProfileList => "PROFILE_LIST",
+        MessageType.ProfileSelect => "PROFILE_SELECT",
+        MessageType.ProfileSelected => "PROFILE_SELECTED",
+        MessageType.ConfigPush => "CONFIG_PUSH",
+        MessageType.Status => "STATUS",
+        MessageType.GamepadStatus => "GAMEPAD_STATUS",
+        _ => $"0x{type:X2}"
+    };
+}
+
+/// <summary>Integration-server listener: prints machine-readable C#: markers to
+/// stdout so the Dart integration tool can assert on them cross-language.</summary>
+sealed class IntegrationListener : ISessionListener
+{
+    public void OnStateChanged(ServerSessionState state)
+    {
+        Console.WriteLine($"C#:STATE:{state}");
+        Console.Out.Flush();
+    }
+
+    public void OnError(string message)
+    {
+        Console.WriteLine($"C#:ERR:{message}");
+        Console.Out.Flush();
+    }
+
+    public void OnInputEvent(InputEvent inputEvent)
+    {
+        Console.WriteLine($"C#:INPUT_EVENT:{inputEvent.ControlId}:{inputEvent.Kind}:" +
+            $"{inputEvent.State ?? 0}:{inputEvent.PressCount ?? 0}");
+        Console.Out.Flush();
+    }
+
+    public void OnInputSnapshot(InputSnapshotPayload snapshot)
+    {
+        Console.WriteLine($"C#:INPUT_SNAPSHOT:{snapshot.Events.Count}");
+        Console.Out.Flush();
+    }
+}
+
+sealed class IntegrationFlusher : IInputStateFlusher
+{
+    public void Flush()
+    {
+        Console.WriteLine("C#:FLUSH");
+        Console.Out.Flush();
+    }
+}
+
+/// <summary>Wraps a real transport connection and logs every frame it sends or
+/// receives as C#:TX / C#:RX markers with the message type and sequence.</summary>
+sealed class RecordingTransportConnection : ITransportConnection
+{
+    private readonly ITransportConnection _inner;
+    private event Action<ProtocolFrame>? _frameReceived;
+    private event Action<string>? _disconnected;
+
+    public RecordingTransportConnection(ITransportConnection inner)
+    {
+        _inner = inner;
+        _inner.FrameReceived += frame =>
+        {
+            Console.WriteLine($"C#:RX:{IntegrationLog.Name(frame.MessageType)}:{frame.Sequence}");
+            Console.Out.Flush();
+            _frameReceived?.Invoke(frame);
+        };
+        _inner.Disconnected += reason =>
+        {
+            Console.WriteLine($"C#:LOST:{reason}");
+            Console.Out.Flush();
+            _disconnected?.Invoke(reason);
+        };
+    }
+
+    public bool IsConnected => _inner.IsConnected;
+
+    public event Action<ProtocolFrame>? FrameReceived
+    {
+        add => _frameReceived += value;
+        remove => _frameReceived -= value;
+    }
+
+    public event Action<string>? Disconnected
+    {
+        add => _disconnected += value;
+        remove => _disconnected -= value;
+    }
+
+    public async Task SendAsync(byte[] frame, CancellationToken cancellationToken = default)
+    {
+        var decoded = FrameCodec.Decode(frame);
+        Console.WriteLine($"C#:TX:{IntegrationLog.Name(decoded.MessageType)}:{decoded.Sequence}");
+        Console.Out.Flush();
+        await _inner.SendAsync(frame, cancellationToken);
+    }
+
+    public Task CloseAsync() => _inner.CloseAsync();
 }

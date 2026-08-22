@@ -3,6 +3,10 @@ enum ClientSessionState {
   /// No transport connection.
   closed,
 
+  /// Transport connect in progress (or about to start on the established
+  /// transport). Transient; the next state is [connected].
+  connecting,
+
   /// Transport connected; HELLO not yet sent.
   connected,
 
