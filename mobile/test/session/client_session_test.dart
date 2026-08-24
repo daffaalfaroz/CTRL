@@ -937,7 +937,8 @@ void main() {
       await session.waitForIdle();
 
       expect(session.state, ClientSessionState.ready);
-      final saved = store.load(deviceId);
+      await _drainMicrotasks();
+      final saved = await store.load(deviceId);
       expect(saved, isNotNull);
       expect(saved, orderedEquals(issuedToken));
     });
@@ -956,8 +957,9 @@ void main() {
         tokenStore: store,
       );
       await _toReady(session, fake);
+      await _drainMicrotasks();
 
-      final saved = store.load(deviceId)!;
+      final saved = await store.load(deviceId);
       expect(saved, orderedEquals(existing));
     });
   });
@@ -982,6 +984,9 @@ Future<void> _toReady(ClientSession session, FakeTransport fake) async {
   await session.waitForIdle();
   expect(session.state, ClientSessionState.ready);
 }
+
+/// Lets fire-and-forget futures (e.g. TokenStore.save) settle.
+Future<void> _drainMicrotasks() => Future<void>.delayed(Duration.zero);
 
 class _FixedSnapshotProvider implements InputSnapshotProvider {
   final InputSnapshotPayload snapshot;

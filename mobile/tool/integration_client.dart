@@ -117,10 +117,22 @@ Future<void> _run(String host, int port) async {
   _expect(authOk.serverCapabilities != 0, 'AUTH_OK carries capabilities');
   _expect(authOk.newToken.length == 32,
       'pairing AUTH_OK issues a 32-byte newToken');
-  final savedToken = tokenStore.load(deviceId);
-  _expect(savedToken != null && _bytesEqual(savedToken, authOk.newToken),
+  Uint8List? savedToken;
+  final persistDeadline =
+      DateTime.now().add(const Duration(seconds: 5));
+  while (savedToken == null) {
+    savedToken = await tokenStore.load(deviceId);
+    if (savedToken != null) {
+      break;
+    }
+    if (DateTime.now().isAfter(persistDeadline)) {
+      throw _IntegrationFailure('newToken persisted through the TokenStore');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  _expect(_bytesEqual(savedToken, authOk.newToken),
       'client stored the issued newToken (§12)');
-  final tokenForReconnect = Uint8List.fromList(savedToken!);
+  final tokenForReconnect = Uint8List.fromList(savedToken);
 
   // Dart -> C#: HELLO(0), AUTH(1), then the mandatory snapshot restarts at 0.
   _expect(recordingA.sentFrames.length == 3, 'three frames sent by phase 1');

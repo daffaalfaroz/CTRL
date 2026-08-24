@@ -361,8 +361,14 @@ class ClientSession {
 
     // §12: pairing success carries a newToken the client must store.
     if (authOk.newToken.isNotEmpty) {
-      tokenStore.save(
-          authenticator.deviceId, Uint8List.fromList(authOk.newToken));
+      final token = Uint8List.fromList(authOk.newToken);
+      final store = tokenStore;
+      unawaited(store
+          .save(authenticator.deviceId, token)
+          .catchError((Object e) {
+        // Never include token material in diagnostics.
+        listener.onError('Failed to persist newToken: $e');
+      }));
     }
 
     _becomeReady();
