@@ -30,6 +30,8 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
     private readonly object _gate = new();
     private readonly HashSet<ushort> _heldKeys = new();
     private readonly HashSet<Win32MouseButton> _heldButtons = new();
+    private readonly HashSet<Win32GamepadButton> _heldGamepadButtons = new();
+    private readonly Dictionary<string, (float Fx, float Fy)> _gamepadAxes = new();
     private readonly Func<IReadOnlyList<Win32Output>, int> _send;
     private readonly bool _motionLoopEnabled;
     private readonly ITimer? _motionTimer;
@@ -77,6 +79,35 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
         }
     }
 
+    /// <summary>Gamepad buttons currently held down (test/diagnostic view).</summary>
+    public IReadOnlyCollection<Win32GamepadButton> HeldGamepadButtons
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _heldGamepadButtons.ToArray();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Current gamepad analog state (M2.4): keys are canonical control ids
+    /// ("gamepad:lstick", "gamepad:rstick", "gamepad:lt", "gamepad:rt") and
+    /// values are (Fx, Fy) pairs — sticks use x/y, triggers store the value in
+    /// Fx. Preserves protocol values; no deadzone is applied.
+    /// </summary>
+    public IReadOnlyDictionary<string, (float Fx, float Fy)> GamepadAxes
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _gamepadAxes.ToDictionary(kv => kv.Key, kv => kv.Value);
+            }
+        }
+    }
+
     /// <summary>
     /// Number of SendInput batches whose reported sent-count fell short of the
     /// requested action count. Diagnostics only — logical state is always kept
@@ -102,6 +133,9 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
         {
             var snapshotKeys = new HashSet<ushort>();
             var snapshotButtons = new HashSet<Win32MouseButton>();
+            var snapshotGamepad = new HashSet<Win32GamepadButton>();
+            var snapshotAxesRestated = new HashSet<string>();
+            var restatedAxes = new Dictionary<string, (float Fx, float Fy)>();
 
             foreach (var input in events)
             {
@@ -115,6 +149,29 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
                     case Win32OutputKind.MouseDown:
                         if (snapshotButtons.Add(mapped.MouseButton) && _heldButtons.Add(mapped.MouseButton))
                             instantActions.Add(mapped);
+                        break;
+                    case Win32OutputKind.GamepadButtonDown:
+                        if (snapshotGamepad.Add(mapped.GamepadButton))
+                        {
+                            if (_heldGamepadButtons.Add(mapped.GamepadButton))
+                                instantActions.Add(mapped);
+                        }
+                        break;
+                    case Win32OutputKind.GamepadStickState:
+                        snapshotAxesRestated.Add(
+                            mapped.VirtualKey == 1 ? "gamepad:lstick" : "gamepad:rstick");
+                        restatedAxes[mapped.VirtualKey == 1 ? "gamepad:lstick" : "gamepad:rstick"] =
+                            (mapped.Fx, mapped.Fy);
+                        break;
+                    case Win32OutputKind.GamepadTriggerState:
+                        snapshotAxesRestated.Add(
+                            mapped.VirtualKey == 1 ? "gamepad:lt" : "gamepad:rt");
+                        restatedAxes[mapped.VirtualKey == 1 ? "gamepad:lt" : "gamepad:rt"] =
+                            (mapped.Fx, 0);
+                        break;
+                    case Win32OutputKind.GamepadHatState:
+                        snapshotAxesRestated.Add("gamepad:dpad");
+                        restatedAxes["gamepad:dpad"] = (mapped.VirtualKey, 0);
                         break;
                     case Win32OutputKind.MoveVelocity:
                         _moveVx = mapped.Fx;
@@ -140,6 +197,12 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
                 _heldButtons.Remove(button);
                 instantActions.Add(Win32Output.Mouse(Win32OutputKind.MouseUp, button));
             }
+            foreach (var gp in _heldGamepadButtons.Where(g => !snapshotGamepad.Contains(g)).ToArray())
+                _heldGamepadButtons.Remove(gp);
+            foreach (var axis in _gamepadAxes.Keys.Where(a => !snapshotAxesRestated.Contains(a)).ToArray())
+                _gamepadAxes.Remove(axis);
+            foreach (var kv in restatedAxes)
+                _gamepadAxes[kv.Key] = kv.Value;
         }
         if (instantActions.Count > 0)
             SendTracked(instantActions);
@@ -165,7 +228,7 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
                 var dy = (int)Math.Round(_moveVy * scaled * MaxMovePixelsPerSecond * seconds);
                 if (dx != 0 || dy != 0)
                     outputs.Add(new Win32Output(Win32OutputKind.MoveVelocity, 0, false,
-                        Win32MouseButton.None, dx, dy));
+                        Win32MouseButton.None, Win32GamepadButton.None, dx, dy));
             }
 
             // Wheel notch accumulation.
@@ -186,18 +249,31 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
             SendTracked(outputs);
     }
 
-    /// <summary>Returns every output to neutral: keys, mouse buttons and
-    /// motion state (docs/protocol.md §16). Idempotent.</summary>
+    /// <summary>Returns every output to neutral: keys, mouse buttons, gamepad
+    /// state and motion (docs/protocol.md §16). Idempotent.</summary>
     public void ReleaseAll()
     {
         ReleaseKeys();
         ReleaseMouseButtons();
         lock (_gate)
         {
+            _heldGamepadButtons.Clear();
+            _gamepadAxes.Clear();
             // Motion state resets to neutral too (§16).
             _moveVx = _moveVy = 0;
             _wheelUpSpeed = _wheelDownSpeed = 0;
             _wheelUpAccum = _wheelDownAccum = 0;
+        }
+    }
+
+    /// <summary>Releases only gamepad state (buttons + analog axes). Isolated
+    /// from keyboard/mouse; idempotent. M2.4.</summary>
+    public void ReleaseGamepad()
+    {
+        lock (_gate)
+        {
+            _heldGamepadButtons.Clear();
+            _gamepadAxes.Clear();
         }
     }
 
@@ -245,7 +321,7 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
 
     private static Win32Output Wheel(ushort direction) =>
         new(Win32OutputKind.WheelVelocity, direction, true,
-            Win32MouseButton.None,
+            Win32MouseButton.None, Win32GamepadButton.None,
             direction == Win32InputMapper.WheelDirectionUp ? NativeMethods.WHEEL_DELTA : -NativeMethods.WHEEL_DELTA,
             0);
 
@@ -284,6 +360,26 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
                             _wheelUpSpeed = mapped.Fx;
                         else
                             _wheelDownSpeed = mapped.Fx;
+                        break;
+                    case Win32OutputKind.GamepadButtonDown:
+                        // Abstract-gamepad state only: no native SendInput exists
+                        // for gamepads (see analisis-teknis.md §16) — tracked so
+                        // bindings/snapshot/ReleaseAll stay authoritative.
+                        _heldGamepadButtons.Add(mapped.GamepadButton);
+                        break;
+                    case Win32OutputKind.GamepadButtonUp:
+                        _heldGamepadButtons.Remove(mapped.GamepadButton);
+                        break;
+                    case Win32OutputKind.GamepadStickState:
+                        _gamepadAxes[mapped.VirtualKey == 1 ? "gamepad:lstick" : "gamepad:rstick"] =
+                            (mapped.Fx, mapped.Fy);
+                        break;
+                    case Win32OutputKind.GamepadTriggerState:
+                        _gamepadAxes[mapped.VirtualKey == 1 ? "gamepad:lt" : "gamepad:rt"] =
+                            (mapped.Fx, 0);
+                        break;
+                    case Win32OutputKind.GamepadHatState:
+                        _gamepadAxes["gamepad:dpad"] = (mapped.VirtualKey, 0);
                         break;
                 }
             }

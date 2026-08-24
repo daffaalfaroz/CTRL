@@ -60,6 +60,7 @@ RunOutputSinkSmokeTests();
 RunWin32MapperSmokeTests();
 RunMouseSinkSmokeTests();
 await RunInputReliabilitySmokeTests();
+RunGamepadInputSmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
@@ -2580,6 +2581,163 @@ static async Task RunInputReliabilitySmokeTests()
 
     Console.WriteLine("M2.3: input reliability smoke tests passed.");
 }
+
+// ---------------------------------------------------------------------------
+// M2.4 — gamepad input (abstract gamepad per CAP_GAMEPAD, §8/§9/§18)
+// ---------------------------------------------------------------------------
+
+static void RunGamepadInputSmokeTests()
+{
+    static InputEvent GpButton(string id, byte state, byte flags = InputEventCodec.FlagStateChanged) =>
+        new(id, InputEventCodec.KindButton, flags, State: state, PressCount: 1);
+
+    static InputEvent KeyButton(string id, byte state) =>
+        new(id, InputEventCodec.KindButton, InputEventCodec.FlagStateChanged, State: state, PressCount: 1);
+
+    static InputEvent MouseEvent(string id, byte state) =>
+        new(id, InputEventCodec.KindButton, InputEventCodec.FlagStateChanged, State: state, PressCount: 1);
+
+    // --- Buttons: A/B/X/Y + shoulders + back/start + stick clicks ------------
+    var sink = new Win32InputSink(motionLoopEnabled: false);
+    sink.HandleInput(GpButton("gamepad:a", InputEventCodec.StateDown));
+    sink.HandleInput(GpButton("gamepad:b", InputEventCodec.StateDown));
+    Assert(new HashSet<Win32GamepadButton>(sink.HeldGamepadButtons)
+               .SetEquals(new[] { Win32GamepadButton.A, Win32GamepadButton.B }),
+        "gamepad A+B held");
+    sink.HandleInput(GpButton("gamepad:a", InputEventCodec.StateUp));
+    Assert(new HashSet<Win32GamepadButton>(sink.HeldGamepadButtons)
+               .SetEquals(new[] { Win32GamepadButton.B }),
+        "gamepad A released, B still held");
+
+    // Duplicates.
+    sink.HandleInput(GpButton("gamepad:b", InputEventCodec.StateDown)); // duplicate down
+    Assert(sink.HeldGamepadButtons.Count == 1, "duplicate gamepad DOWN must not double-track");
+    sink.HandleInput(GpButton("gamepad:b", InputEventCodec.StateUp));
+    sink.HandleInput(GpButton("gamepad:b", InputEventCodec.StateUp)); // duplicate up
+    Assert(sink.HeldGamepadButtons.Count == 0, "double gamepad UP leaves empty held state");
+
+    // Full button vocabulary.
+    foreach (var (id, expected) in new[]
+             {
+                 ("gamepad:x", Win32GamepadButton.X),
+                 ("gamepad:y", Win32GamepadButton.Y),
+                 ("gamepad:lb", Win32GamepadButton.LeftShoulder),
+                 ("gamepad:rb", Win32GamepadButton.RightShoulder),
+                 ("gamepad:back", Win32GamepadButton.Back),
+                 ("gamepad:start", Win32GamepadButton.Start),
+                 ("gamepad:lsclick", Win32GamepadButton.LeftStickClick),
+                 ("gamepad:rsclick", Win32GamepadButton.RightStickClick),
+             })
+    {
+        var mapped = Win32InputMapper.Map(GpButton(id, InputEventCodec.StateDown));
+        Assert(mapped is { Kind: Win32OutputKind.GamepadButtonDown } && mapped.GamepadButton == expected,
+            $"gamepad control '{id}' maps correctly");
+    }
+
+    // --- Analog sticks: value semantics preserved ----------------------------
+    var stickSink = new Win32InputSink(motionLoopEnabled: false);
+    stickSink.HandleInput(new InputEvent(
+        "gamepad:lstick", InputEventCodec.KindStick, 0, X: -0.8f, Y: 0.4f));
+    var lstick = stickSink.GamepadAxes["gamepad:lstick"];
+    Assert(Math.Abs(lsticks_Fx(lstick) + 0.8f) < 0.0001f && Math.Abs(lsticks_Fy(lstick) - 0.4f) < 0.0001f,
+        "left stick preserves protocol values (-0.8, 0.4)");
+
+    stickSink.HandleInput(new InputEvent(
+        "gamepad:rstick", InputEventCodec.KindStick, 0, X: 2.0f, Y: -2.0f));
+    var rstick = stickSink.GamepadAxes["gamepad:rstick"];
+    Assert(rstick.Fx == 1f && rstick.Fy == -1f,
+        "right stick values outside -1..1 are clamped per §9");
+
+    stickSink.HandleInput(new InputEvent(
+        "gamepad:rstick", InputEventCodec.KindStick, 0, X: 0f, Y: 0f));
+    Assert(stickSink.GamepadAxes["gamepad:rstick"] is { Fx: 0f, Fy: 0f },
+        "neutral reset restores stick center");
+
+    // Non-finite stick input is dropped (§18 input-plane semantics).
+    var beforeNan = stickSink.GamepadAxes.Count;
+    stickSink.HandleInput(new InputEvent(
+        "gamepad:lstick", InputEventCodec.KindStick, 0, X: float.NaN, Y: 0f));
+    Assert(stickSink.GamepadAxes.Count == beforeNan &&
+           Math.Abs(stickSink.GamepadAxes["gamepad:lstick"].Fx + 0.8f) < 0.0001f,
+        "NaN stick values are dropped without corrupting state");
+
+    // --- Triggers: analog 0..1 ------------------------------------------------
+    var trig = Win32InputMapper.Map(new InputEvent(
+        "gamepad:rt", InputEventCodec.KindTrigger, 0, Value: 0.5f));
+    Assert(trig is { Kind: Win32OutputKind.GamepadTriggerState, VirtualKey: 2 } && Math.Abs(trig.Fx - 0.5f) < 0.0001f,
+        "right trigger maps intermediate analog value");
+    var ltMin = Win32InputMapper.Map(new InputEvent(
+        "gamepad:lt", InputEventCodec.KindTrigger, 0, Value: 0f));
+    Assert(ltMin is { Kind: Win32OutputKind.GamepadTriggerState, VirtualKey: 1 } && ltMin.Fx == 0f,
+        "left trigger minimum maps to 0");
+    var rtMax = Win32InputMapper.Map(new InputEvent(
+        "gamepad:rt", InputEventCodec.KindTrigger, 0, Value: 1f));
+    Assert(rtMax.Fx == 1f, "right trigger maximum maps to 1");
+    var overClamp = Win32InputMapper.Map(new InputEvent(
+        "gamepad:lt", InputEventCodec.KindTrigger, 0, Value: 5f));
+    Assert(overClamp.Fx == 1f, "out-of-range trigger clamps to 1 per §9 normalization");
+    stickSink.HandleInput(new InputEvent(
+        "gamepad:rt", InputEventCodec.KindTrigger, 0, Value: 0.75f));
+    Assert(Math.Abs(stickSink.GamepadAxes["gamepad:rt"].Fx - 0.75f) < 0.0001f,
+        "trigger state tracked in gamepad axes");
+
+    // --- D-pad / hat ------------------------------------------------------------
+    for (byte hat = 0; hat <= 8; hat++)
+    {
+        var mapped = Win32InputMapper.Map(new InputEvent(
+            "gamepad:dpad", InputEventCodec.KindHat, 0, HatValue: hat));
+        if (mapped.Kind != Win32OutputKind.GamepadHatState || mapped.VirtualKey != hat)
+            throw new Exception($"hat {hat} must map to GamepadHatState with raw value preserved");
+    }
+    Assert(Win32InputMapper.Map(new InputEvent(
+        "gamepad:dpad", InputEventCodec.KindHat, 0, HatValue: 9)).Kind == Win32OutputKind.None,
+        "hat value 9 is invalid and dropped (§18)");
+
+    // --- Keyboard/mouse/gamepad isolation --------------------------------------
+    var iso = new Win32InputSink(motionLoopEnabled: false);
+    iso.HandleInput(KeyButton("key:A", InputEventCodec.StateDown));
+    iso.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateDown));
+    iso.HandleInput(GpButton("gamepad:a", InputEventCodec.StateDown));
+    Assert(iso.HeldKeys.Contains((ushort)'A') &&
+           iso.HeldButtons.Contains(Win32MouseButton.Left) &&
+           iso.HeldGamepadButtons.Contains(Win32GamepadButton.A),
+        "precondition: one held input in each category");
+    iso.ReleaseKeys();
+    Assert(iso.HeldKeys.Count == 0 && iso.HeldButtons.Contains(Win32MouseButton.Left) &&
+           iso.HeldGamepadButtons.Contains(Win32GamepadButton.A),
+        "ReleaseKeys leaves mouse and gamepad untouched");
+    iso.ReleaseMouseButtons();
+    Assert(iso.HeldButtons.Count == 0 && iso.HeldKeys.Count == 0 &&
+           iso.HeldGamepadButtons.Contains(Win32GamepadButton.A),
+        "ReleaseMouseButtons leaves keyboard and gamepad untouched");
+    iso.HandleInput(MouseEvent("mouse:right", InputEventCodec.StateDown));
+    iso.ReleaseAll();
+    Assert(iso.HeldKeys.Count == 0 && iso.HeldButtons.Count == 0 && iso.HeldGamepadButtons.Count == 0
+           && iso.GamepadAxes.Count == 0,
+        "ReleaseAll clears all three categories plus axes");
+
+    // --- Snapshot reconciliation includes gamepad ------------------------------
+    var snap = new Win32InputSink(motionLoopEnabled: false);
+    snap.HandleInput(GpButton("gamepad:a", InputEventCodec.StateDown));
+    snap.HandleInput(GpButton("gamepad:b", InputEventCodec.StateDown));
+    snap.HandleInput(new InputEvent(
+        "gamepad:rt", InputEventCodec.KindTrigger, 0, Value: 0.5f));
+    snap.HandleSnapshot(new InputSnapshotPayload(new List<InputEvent>
+    {
+        GpButton("gamepad:a", InputEventCodec.StateDown,
+            InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial),
+    }));
+    Assert(new HashSet<Win32GamepadButton>(snap.HeldGamepadButtons)
+               .SetEquals(new[] { Win32GamepadButton.A }),
+        "snapshot keeps listed gamepad button and releases B");
+    Assert(!snap.GamepadAxes.ContainsKey("gamepad:rt"),
+        "snapshot omits right trigger -> axis returns to neutral");
+
+    Console.WriteLine("M2.4: gamepad input smoke tests passed.");
+}
+
+static float lsticks_Fx((float Fx, float Fy) axis) => axis.Fx;
+static float lsticks_Fy((float Fx, float Fy) axis) => axis.Fy;
 
 sealed class TestData
 {
