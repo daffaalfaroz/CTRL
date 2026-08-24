@@ -133,6 +133,8 @@ try {
     Require-Count $serverOut '^C#:INPUT_EVENT:btn-fire:0:1:1' 2 'decoded button INPUT_EVENT'
     Require-Count $serverOut '^C#:INPUT_EVENT:thr:3:0:0' 1 'decoded trigger INPUT_EVENT'
     Require-Count $serverOut '^C#:INPUT_EVENT:key:A:0:1:1' 1 'decoded keyboard INPUT_EVENT (M2.1)'
+    Require-Count $serverOut '^C#:INPUT_EVENT:mouse:left:0:1:1' 1 'decoded mouse-left down INPUT_EVENT (M2.2)'
+    Require-Count $serverOut '^C#:INPUT_EVENT:mouse:left:0:0:1' 1 'decoded mouse-left up INPUT_EVENT (M2.2)'
     Require-Count $serverOut '^C#:RX:HEARTBEAT:' 1 'received HEARTBEAT'
     Require-Count $serverOut '^C#:TX:PONG:' 1 'sent PONG'
     Require-Count $serverOut '^C#:TX:ERROR:' 2 'protocol ERRORs sent (device-limit + unsupported-message)'

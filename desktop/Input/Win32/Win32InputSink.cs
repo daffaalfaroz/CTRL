@@ -4,23 +4,53 @@ using CTRL.Desktop.Protocol;
 namespace CTRL.Desktop.Input.Win32;
 
 /// <summary>
-/// Minimal Win32 output sink: forwards mapped keyboard events to the OS via
-/// SendInput and releases everything on demand (§16 flush). M2.0 scope is the
-/// keyboard boundary only — pointer/axis/gamepad outputs are ignored by the
-/// mapper until later milestones.
+/// Win32 output sink. M2.0 shipped the keyboard boundary; M2.2 adds relative
+/// mouse movement, L/R/M buttons and wheel scroll.
 ///
-/// The send path is injectable so tests can verify down/up sequencing and
-/// ReleaseAll bookkeeping without injecting real input into the host session.
+/// Mouse semantics (analisis-teknis.md §15): stick "mouse:move" feeds a
+/// velocity that a small desktop-side loop converts to relative deltas with an
+/// exponent curve; wheel axes accumulate into notches. The loop runs on a
+/// ~60 Hz timer in production; tests disable it (<c>motionLoopEnabled:false</c>)
+/// and drive <see cref="PumpTick"/> manually for deterministic assertions.
+///
+/// All Windows interop stays in this class — the session only knows
+/// <see cref="IOutputSink"/>.
 /// </summary>
-public sealed class Win32InputSink : IOutputSink
+public sealed class Win32InputSink : IOutputSink, IDisposable
 {
+    /// <summary>Cursor pixels per second at full stick deflection.</summary>
+    public const int MaxMovePixelsPerSecond = 1200;
+
+    /// <summary>Motion loop cadence (~60 Hz).</summary>
+    public const int MotionTickMs = 16;
+
+    /// <summary>Full-deflection wheel notches per second.</summary>
+    public const double MaxWheelNotchesPerSecond = 6.0;
+
     private readonly object _gate = new();
     private readonly HashSet<ushort> _heldKeys = new();
+    private readonly HashSet<Win32MouseButton> _heldButtons = new();
     private readonly Func<IReadOnlyList<Win32Output>, int> _send;
+    private readonly bool _motionLoopEnabled;
+    private readonly ITimer? _motionTimer;
+    private float _moveVx;
+    private float _moveVy;
+    private float _wheelUpSpeed;
+    private float _wheelDownSpeed;
+    private double _wheelUpAccum;
+    private double _wheelDownAccum;
+    private bool _disposed;
 
-    public Win32InputSink(Func<IReadOnlyList<Win32Output>, int>? send = null)
+    public Win32InputSink(Func<IReadOnlyList<Win32Output>, int>? send = null, bool motionLoopEnabled = true)
     {
         _send = send ?? NativeSend;
+        _motionLoopEnabled = motionLoopEnabled;
+        if (motionLoopEnabled)
+        {
+            _motionTimer = new Timer(
+                _ => { try { PumpTick(); } catch { /* loop must never throw */ } },
+                null, MotionTickMs, MotionTickMs);
+        }
     }
 
     /// <summary>Virtual keys currently held down (test/diagnostic view).</summary>
@@ -35,28 +65,102 @@ public sealed class Win32InputSink : IOutputSink
         }
     }
 
+    /// <summary>Mouse buttons currently held down (test/diagnostic view).</summary>
+    public IReadOnlyCollection<Win32MouseButton> HeldButtons
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _heldButtons.ToArray();
+            }
+        }
+    }
+
     public void HandleInput(InputEvent input) => Apply(new[] { input });
 
     public void HandleSnapshot(InputSnapshotPayload snapshot) => Apply(snapshot.Events);
+
+    /// <summary>
+    /// One motion-loop iteration: converts stored stick velocity into relative
+    /// cursor deltas and wheel axis speeds into ±120 notches. Public so tests
+    /// can drive it deterministically when the real timer is disabled.
+    /// </summary>
+    public void PumpTick()
+    {
+        List<Win32Output> outputs = new();
+        lock (_gate)
+        {
+            // Relative cursor movement (exponent curve: fine control near center).
+            var magnitude = Math.Sqrt(_moveVx * _moveVx + _moveVy * _moveVy);
+            if (magnitude > 0.001)
+            {
+                var scaled = Math.Pow(magnitude, 1.6) / magnitude; // curve keeps direction
+                var seconds = MotionTickMs / 1000.0;
+                var dx = (int)Math.Round(_moveVx * scaled * MaxMovePixelsPerSecond * seconds);
+                var dy = (int)Math.Round(_moveVy * scaled * MaxMovePixelsPerSecond * seconds);
+                if (dx != 0 || dy != 0)
+                    outputs.Add(new Win32Output(Win32OutputKind.MoveVelocity, 0, false,
+                        Win32MouseButton.None, dx, dy));
+            }
+
+            // Wheel notch accumulation.
+            _wheelUpAccum += _wheelUpSpeed * MaxWheelNotchesPerSecond * MotionTickMs / 1000.0;
+            while (_wheelUpAccum >= 1.0)
+            {
+                _wheelUpAccum -= 1.0;
+                outputs.Add(Wheel(Win32InputMapper.WheelDirectionUp));
+            }
+            _wheelDownAccum += _wheelDownSpeed * MaxWheelNotchesPerSecond * MotionTickMs / 1000.0;
+            while (_wheelDownAccum >= 1.0)
+            {
+                _wheelDownAccum -= 1.0;
+                outputs.Add(Wheel(Win32InputMapper.WheelDirectionDown));
+            }
+        }
+        if (outputs.Count > 0)
+            _send(outputs);
+    }
 
     public void ReleaseAll()
     {
         List<Win32Output> releases;
         lock (_gate)
         {
-            if (_heldKeys.Count == 0)
-                return;
-            releases = _heldKeys
-                .Select(vk => new Win32Output(Win32OutputKind.KeyUp, vk, Win32InputMapper.IsExtended(vk)))
-                .ToList();
+            releases = new List<Win32Output>(
+                _heldKeys.Count + _heldButtons.Count);
+            foreach (var vk in _heldKeys)
+                releases.Add(Win32Output.Key(Win32OutputKind.KeyUp, vk, Win32InputMapper.IsExtended(vk)));
+            foreach (var button in _heldButtons)
+                releases.Add(Win32Output.Mouse(Win32OutputKind.MouseUp, button));
             _heldKeys.Clear();
+            _heldButtons.Clear();
+            // Motion state resets to neutral too (§16).
+            _moveVx = _moveVy = 0;
+            _wheelUpSpeed = _wheelDownSpeed = 0;
+            _wheelUpAccum = _wheelDownAccum = 0;
         }
-        _send(releases);
+        if (releases.Count > 0)
+            _send(releases);
     }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+        _disposed = true;
+        _motionTimer?.Dispose();
+    }
+
+    private static Win32Output Wheel(ushort direction) =>
+        new(Win32OutputKind.WheelVelocity, direction, true,
+            Win32MouseButton.None,
+            direction == Win32InputMapper.WheelDirectionUp ? NativeMethods.WHEEL_DELTA : -NativeMethods.WHEEL_DELTA,
+            0);
 
     private void Apply(IReadOnlyList<InputEvent> events)
     {
-        var actions = new List<Win32Output>(events.Count);
+        var instantActions = new List<Win32Output>(events.Count);
         lock (_gate)
         {
             foreach (var input in events)
@@ -66,17 +170,35 @@ public sealed class Win32InputSink : IOutputSink
                 {
                     case Win32OutputKind.KeyDown:
                         if (_heldKeys.Add(mapped.VirtualKey))
-                            actions.Add(mapped);
+                            instantActions.Add(mapped);
                         break;
                     case Win32OutputKind.KeyUp:
                         if (_heldKeys.Remove(mapped.VirtualKey))
-                            actions.Add(mapped);
+                            instantActions.Add(mapped);
+                        break;
+                    case Win32OutputKind.MouseDown:
+                        if (_heldButtons.Add(mapped.MouseButton))
+                            instantActions.Add(mapped);
+                        break;
+                    case Win32OutputKind.MouseUp:
+                        if (_heldButtons.Remove(mapped.MouseButton))
+                            instantActions.Add(mapped);
+                        break;
+                    case Win32OutputKind.MoveVelocity:
+                        _moveVx = mapped.Fx;
+                        _moveVy = mapped.Fy;
+                        break;
+                    case Win32OutputKind.WheelVelocity:
+                        if (mapped.VirtualKey == Win32InputMapper.WheelDirectionUp)
+                            _wheelUpSpeed = mapped.Fx;
+                        else
+                            _wheelDownSpeed = mapped.Fx;
                         break;
                 }
             }
         }
-        if (actions.Count > 0)
-            _send(actions);
+        if (instantActions.Count > 0)
+            _send(instantActions);
     }
 
     private static int NativeSend(IReadOnlyList<Win32Output> outputs)
@@ -84,35 +206,91 @@ public sealed class Win32InputSink : IOutputSink
         var inputs = new NativeMethods.INPUT[outputs.Count];
         for (var i = 0; i < outputs.Count; i++)
         {
-            uint flags = 0;
-            if (outputs[i].Kind == Win32OutputKind.KeyUp)
-                flags |= NativeMethods.KEYEVENTF_KEYUP;
-            if (outputs[i].Extended)
-                flags |= NativeMethods.KEYEVENTF_EXTENDEDKEY;
-
-            inputs[i] = new NativeMethods.INPUT
+            var output = outputs[i];
+            switch (output.Kind)
             {
-                type = NativeMethods.INPUT_KEYBOARD,
-                U = new NativeMethods.InputUnion
+                case Win32OutputKind.KeyDown:
+                case Win32OutputKind.KeyUp:
                 {
-                    ki = new NativeMethods.KEYBDINPUT
+                    uint flags = 0;
+                    if (output.Kind == Win32OutputKind.KeyUp)
+                        flags |= NativeMethods.KEYEVENTF_KEYUP;
+                    if (output.Extended)
+                        flags |= NativeMethods.KEYEVENTF_EXTENDEDKEY;
+                    inputs[i] = Keyboard(output.VirtualKey, flags);
+                    break;
+                }
+                case Win32OutputKind.MouseDown:
+                case Win32OutputKind.MouseUp:
+                {
+                    uint flags = output.MouseButton switch
                     {
-                        wVk = (ushort)outputs[i].VirtualKey,
-                        dwFlags = flags,
-                    },
-                },
-            };
+                        Win32MouseButton.Left => output.Kind == Win32OutputKind.MouseDown
+                            ? NativeMethods.MOUSEEVENTF_LEFTDOWN
+                            : NativeMethods.MOUSEEVENTF_LEFTUP,
+                        Win32MouseButton.Right => output.Kind == Win32OutputKind.MouseDown
+                            ? NativeMethods.MOUSEEVENTF_RIGHTDOWN
+                            : NativeMethods.MOUSEEVENTF_RIGHTUP,
+                        Win32MouseButton.Middle => output.Kind == Win32OutputKind.MouseDown
+                            ? NativeMethods.MOUSEEVENTF_MIDDLEDOWN
+                            : NativeMethods.MOUSEEVENTF_MIDDLEUP,
+                        _ => 0,
+                    };
+                    inputs[i] = Mouse(flags, 0, 0, 0);
+                    break;
+                }
+                case Win32OutputKind.MoveVelocity:
+                    inputs[i] = Mouse(NativeMethods.MOUSEEVENTF_MOVE,
+                        (int)output.Fx, (int)output.Fy, 0);
+                    break;
+                case Win32OutputKind.WheelVelocity:
+                    inputs[i] = Mouse(NativeMethods.MOUSEEVENTF_WHEEL, 0, 0,
+                        (uint)(int)output.Fx);
+                    break;
+                default:
+                    inputs[i] = Keyboard(0, 0);
+                    break;
+            }
         }
         _ = NativeMethods.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<NativeMethods.INPUT>());
         return inputs.Length;
     }
 
+    private static NativeMethods.INPUT Keyboard(ushort vk, uint flags) => new()
+    {
+        type = NativeMethods.INPUT_KEYBOARD,
+        U = new NativeMethods.InputUnion
+        {
+            ki = new NativeMethods.KEYBDINPUT { wVk = vk, dwFlags = flags },
+        },
+    };
+
+    private static NativeMethods.INPUT Mouse(uint flags, int dx, int dy, uint mouseData) => new()
+    {
+        type = NativeMethods.INPUT_MOUSE,
+        U = new NativeMethods.InputUnion
+        {
+            mi = new NativeMethods.MOUSEINPUT
+            { dx = dx, dy = dy, mouseData = mouseData, dwFlags = flags },
+        },
+    };
+
     /// <summary>SendInput P/Invoke (docs/protocol.md §22: no driver dependency).</summary>
     private static class NativeMethods
     {
         public const uint INPUT_KEYBOARD = 1;
+        public const uint INPUT_MOUSE = 0;
         public const uint KEYEVENTF_KEYUP = 0x0002;
         public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+        public const uint MOUSEEVENTF_MOVE = 0x0001;
+        public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        public const uint MOUSEEVENTF_LEFTUP = 0x0004;
+        public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+        public const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+        public const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+        public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+        public const uint MOUSEEVENTF_WHEEL = 0x0800;
+        public const int WHEEL_DELTA = 120;
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);

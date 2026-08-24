@@ -7,13 +7,50 @@ public enum Win32OutputKind
     None,
     KeyDown,
     KeyUp,
+    MouseDown,
+    MouseUp,
+
+    /// <summary>Stateful: stick position feeds the motion loop (M2.2).</summary>
+    MoveVelocity,
+
+    /// <summary>Stateful: axis value feeds the wheel notch accumulator.</summary>
+    WheelVelocity,
 }
 
-/// <summary>A single mapped output action for the Win32 platform layer.</summary>
-public readonly record struct Win32Output(Win32OutputKind Kind, ushort VirtualKey, bool Extended)
+/// <summary>Mouse buttons recognized by the CTRL binding (M2.2).</summary>
+public enum Win32MouseButton
+{
+    None = 0,
+    Left = 1,
+    Right = 2,
+    Middle = 3,
+}
+
+/// <summary>
+/// A single mapped output action for the Win32 platform layer.
+/// Flat struct with kind-dependent fields (documented per <see cref="Kind"/>):
+///   KeyDown/KeyUp        → VirtualKey (+ Extended)
+///   MouseDown/MouseUp    → MouseButton
+///   MoveVelocity         → Fx/Fy = normalized velocity components (-1..1)
+///   WheelVelocity        → Fx = speed (0..1), VirtualKey = direction
+///                          (0x01 up / 0xFF down — see TryMapWheelDirection)
+/// </summary>
+public readonly record struct Win32Output(
+    Win32OutputKind Kind,
+    ushort VirtualKey,
+    bool Extended,
+    Win32MouseButton MouseButton,
+    float Fx,
+    float Fy)
 {
     /// <summary>Event carries nothing this sink can act on.</summary>
     public static Win32Output None => default;
+
+    public static Win32Output Key(Win32OutputKind kind, ushort vk, bool extended) =>
+        new(kind, vk, extended, Win32MouseButton.None, 0, 0);
+
+    public static Win32Output Mouse(Win32OutputKind kind, Win32MouseButton button) =>
+        new(kind, 0, false, button, 0, 0);
 }
 
 /// <summary>
@@ -121,21 +158,91 @@ public static class Win32InputMapper
 
     public static Win32Output Map(InputEvent input)
     {
-        if (input.Kind != InputEventCodec.KindButton)
-            return Win32Output.None;
+        switch (input.Kind)
+        {
+            case InputEventCodec.KindButton:
+                return MapButton(input);
+            case InputEventCodec.KindStick:
+                return MapStick(input);
+            case InputEventCodec.KindAxis:
+                return MapWheelAxis(input);
+            default:
+                // Trigger/hat mappings are outside M2.2 scope.
+                return Win32Output.None;
+        }
+    }
 
+    private static Win32Output MapButton(InputEvent input)
+    {
+        var button = TryMapMouseButton(input.ControlId);
+        if (button is null)
+            return MapKey(input);
+        if ((input.Flags & (InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial)) == 0)
+            return Win32Output.None;
+        return input.State == InputEventCodec.StateDown
+            ? Win32Output.Mouse(Win32OutputKind.MouseDown, button.Value)
+            : Win32Output.Mouse(Win32OutputKind.MouseUp, button.Value);
+    }
+
+    private static Win32Output MapKey(InputEvent input)
+    {
         var vk = TryResolveVirtualKey(input.ControlId);
         if (vk is null)
             return Win32Output.None;
 
-        var applies = (input.Flags & (InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial)) != 0;
-        if (!applies)
+        if ((input.Flags & (InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial)) == 0)
             return Win32Output.None;
 
         return input.State == InputEventCodec.StateDown
-            ? new Win32Output(Win32OutputKind.KeyDown, vk.Value, IsExtended(vk.Value))
-            : new Win32Output(Win32OutputKind.KeyUp, vk.Value, IsExtended(vk.Value));
+            ? Win32Output.Key(Win32OutputKind.KeyDown, vk.Value, IsExtended(vk.Value))
+            : Win32Output.Key(Win32OutputKind.KeyUp, vk.Value, IsExtended(vk.Value));
     }
+
+    /// <summary>Stick "mouse:move" drives relative cursor velocity (§15 of
+    /// analisis-teknis.md: stick → speed delta on a desktop-side loop).</summary>
+    private static Win32Output MapStick(InputEvent input)
+    {
+        if (!string.Equals(input.ControlId, MoveControlId, StringComparison.OrdinalIgnoreCase))
+            return Win32Output.None;
+        return new Win32Output(Win32OutputKind.MoveVelocity, 0, false,
+            Win32MouseButton.None, Clamp11(input.X ?? 0), Clamp11(input.Y ?? 0));
+    }
+
+    /// <summary>Axis "mouse:wheelup"/"mouse:wheeldown" (0..1) drives wheel notch rate.</summary>
+    private static Win32Output MapWheelAxis(InputEvent input)
+    {
+        var dir = TryMapWheelDirection(input.ControlId);
+        if (dir is null)
+            return Win32Output.None;
+        var speed = Math.Clamp((double)(input.Value ?? 0), 0.0, 1.0);
+        return new Win32Output(Win32OutputKind.WheelVelocity, (ushort)dir.Value, false,
+            Win32MouseButton.None, (float)speed, 0);
+    }
+
+    public const string MoveControlId = "mouse:move";
+    public const string WheelUpControlId = "mouse:wheelup";
+    public const string WheelDownControlId = "mouse:wheeldown";
+    public const ushort WheelDirectionUp = 0x01;
+    public const ushort WheelDirectionDown = 0xFF;
+
+    private static Win32MouseButton? TryMapMouseButton(string controlId) =>
+        controlId switch
+        {
+            "mouse:left" => Win32MouseButton.Left,
+            "mouse:right" => Win32MouseButton.Right,
+            "mouse:middle" => Win32MouseButton.Middle,
+            _ => null,
+        };
+
+    private static ushort? TryMapWheelDirection(string controlId) =>
+        controlId switch
+        {
+            WheelUpControlId => WheelDirectionUp,
+            WheelDownControlId => WheelDirectionDown,
+            _ => null,
+        };
+
+    private static float Clamp11(float v) => Math.Clamp(v, -1f, 1f);
 
     /// <summary>
     /// Resolves "key:&lt;VK&gt;" (decimal/hex) and "key:&lt;NAME&gt;" controlIds.
