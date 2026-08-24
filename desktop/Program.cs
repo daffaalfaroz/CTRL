@@ -59,6 +59,7 @@ RunLockoutSmokeTests();
 RunOutputSinkSmokeTests();
 RunWin32MapperSmokeTests();
 RunMouseSinkSmokeTests();
+await RunInputReliabilitySmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
@@ -1681,7 +1682,8 @@ static async Task<int> RunIntegrationServerAsync(int port)
             authenticator,
             listener,
             options,
-            flusher);
+            flusher,
+            new IntegrationOutputSink());
         session.Authenticated += s =>
         {
             Console.WriteLine($"C#:AUTHENTICATED:{s.DeviceId}");
@@ -2233,17 +2235,23 @@ static void RunWin32MapperSmokeTests()
         Button("key:66", InputEventCodec.StateDown, InputEventCodec.FlagInitial),
         Button("key:67", InputEventCodec.StateUp, InputEventCodec.FlagInitial),
     }));
-    Assert(new HashSet<ushort>(sink.HeldKeys).SetEquals(new[] { (ushort)65, (ushort)66 }),
-        "held-key bookkeeping must track downs and ups");
+    // M2.3: INPUT_SNAPSHOT is authoritative (§15) — key 65 is not in the
+    // snapshot, so reconciliation releases it while pressing 66.
+    Assert(sentActions.Any(a => a is { Kind: Win32OutputKind.KeyDown, VirtualKey: 66 }),
+        "snapshot presses the listed key");
+    Assert(sentActions.Any(a => a is { Kind: Win32OutputKind.KeyUp, VirtualKey: 65 }),
+        "snapshot auto-releases keys it omits");
+    Assert(new HashSet<ushort>(sink.HeldKeys).SetEquals(new[] { (ushort)66 }),
+        "held-key state matches the snapshot exactly");
     var beforeRelease = sentActions.Count;
     sink.ReleaseAll();
     Assert(sink.HeldKeys.Count == 0, "ReleaseAll must empty held keys");
     var releasedKeys = sentActions.Skip(beforeRelease)
         .Where(a => a.Kind == Win32OutputKind.KeyUp).Select(a => a.VirtualKey).ToHashSet();
-    Assert(releasedKeys.SetEquals(new HashSet<ushort> { 65, 66 }),
+    Assert(releasedKeys.SetEquals(new HashSet<ushort> { 66 }),
         "ReleaseAll must release exactly the held keys");
     sink.ReleaseAll();
-    Assert(sentActions.Count == beforeRelease + 2, "ReleaseAll must be idempotent when idle");
+    Assert(sentActions.Count == beforeRelease + 1, "ReleaseAll must be idempotent when idle");
 
     Console.WriteLine("M2.0: win32 mapper smoke tests passed.");
 }
@@ -2374,6 +2382,203 @@ static void RunMouseSinkSmokeTests()
         "snapshot carrying a mouse button reaches the output sink");
 
     Console.WriteLine("M2.2: mouse input smoke tests passed.");
+}
+
+// ---------------------------------------------------------------------------
+// M2.3 — input E2E / reliability
+// ---------------------------------------------------------------------------
+
+static async Task RunInputReliabilitySmokeTests()
+{
+    static InputEvent KeyButton(string id, byte state, byte flags = InputEventCodec.FlagStateChanged) =>
+        new(id, InputEventCodec.KindButton, flags, State: state, PressCount: 1);
+
+    static InputEvent MouseEvent(string id, byte state) =>
+        new(id, InputEventCodec.KindButton, InputEventCodec.FlagStateChanged, State: state, PressCount: 1);
+
+    // --- Duplicate events are deterministic and leave no residue -------------
+    var keySends = new List<Win32Output>();
+    var dupSink = new Win32InputSink(a => { keySends.AddRange(a); return a.Count; }, motionLoopEnabled: false);
+    dupSink.HandleInput(KeyButton("key:A", InputEventCodec.StateDown));
+    var downsAfterFirst = keySends.Count(k => k.Kind == Win32OutputKind.KeyDown);
+    dupSink.HandleInput(KeyButton("key:A", InputEventCodec.StateDown)); // duplicate down
+    Assert(keySends.Count(k => k.Kind == Win32OutputKind.KeyDown) == downsAfterFirst,
+        "duplicate key DOWN must not re-send");
+    Assert(dupSink.HeldKeys.Count == 1, "first DOWN keeps the key held");
+    dupSink.HandleInput(KeyButton("key:A", InputEventCodec.StateUp));
+    var upsAfterFirstUp = keySends.Count(k => k.Kind == Win32OutputKind.KeyUp);
+    dupSink.HandleInput(KeyButton("key:A", InputEventCodec.StateUp)); // duplicate up
+    Assert(keySends.Count(k => k.Kind == Win32OutputKind.KeyUp) == upsAfterFirstUp &&
+           dupSink.HeldKeys.Count == 0,
+        "duplicate key UP must not release again; held state empty");
+
+    var mouseDup = new Win32InputSink(motionLoopEnabled: false);
+    mouseDup.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateDown));
+    var mouseAfterDown = mouseDup.HeldButtons.Count;
+    mouseDup.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateDown));
+    Assert(mouseDup.HeldButtons.Count == mouseAfterDown, "duplicate mouse DOWN must not double-track");
+    mouseDup.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateUp));
+    mouseDup.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateUp));
+    Assert(mouseDup.HeldButtons.Count == 0, "double mouse UP leaves empty held state");
+
+    // --- Keyboard / mouse state isolation ------------------------------------
+    var iso = new Win32InputSink(motionLoopEnabled: false);
+    iso.HandleInput(KeyButton("key:A", InputEventCodec.StateDown));
+    iso.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateDown));
+    iso.ReleaseKeys();
+    Assert(iso.HeldKeys.Count == 0 && iso.HeldButtons.Contains(Win32MouseButton.Left),
+        "ReleaseKeys must not clear held mouse buttons");
+    iso.HandleInput(KeyButton("key:B", InputEventCodec.StateDown));
+    iso.ReleaseMouseButtons();
+    Assert(iso.HeldButtons.Count == 0 && iso.HeldKeys.Contains((ushort)'B'),
+        "ReleaseMouseButtons must not clear held keys");
+    iso.ReleaseAll();
+    Assert(iso.HeldKeys.Count == 0 && iso.HeldButtons.Count == 0,
+        "combined ReleaseAll clears both isolated states");
+
+    // --- Repeated ReleaseAll is safe ------------------------------------------
+    for (var i = 0; i < 3; i++)
+        iso.ReleaseAll();
+    Assert(iso.HeldKeys.Count == 0 && iso.HeldButtons.Count == 0,
+        "repeated ReleaseAll stays neutral without invalid releases");
+
+    // --- Snapshot reconciliation (§15: snapshot is authoritative) -------------
+    var recon = new Win32InputSink(motionLoopEnabled: false);
+    recon.HandleInput(KeyButton("key:A", InputEventCodec.StateDown));
+    recon.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateDown));
+    recon.HandleInput(MouseEvent("mouse:right", InputEventCodec.StateDown));
+    Assert(recon.HeldKeys.Contains((ushort)'A') && recon.HeldButtons.Count == 2,
+        "precondition: A + Left + Right held");
+    recon.HandleSnapshot(new InputSnapshotPayload(new List<InputEvent>
+    {
+        KeyButton("key:A", InputEventCodec.StateDown,
+            InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial),
+        new("mouse:right", InputEventCodec.KindButton,
+            InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial,
+            State: InputEventCodec.StateDown, PressCount: 1),
+    }));
+    Assert(recon.HeldKeys.Contains((ushort)'A'), "snapshot keeps listed key held");
+    Assert(new HashSet<Win32MouseButton>(recon.HeldButtons).SetEquals(new[] { Win32MouseButton.Right }),
+        "snapshot releases buttons it omits and keeps the ones it lists");
+
+    // Empty snapshot returns every snapshot-representable control to neutral.
+    recon.HandleSnapshot(new InputSnapshotPayload(new List<InputEvent>
+    {
+        new("unused-axis", InputEventCodec.KindAxis, 0, Value: 0.5f),
+    }));
+    Assert(recon.HeldKeys.Count == 0 && recon.HeldButtons.Count == 0,
+        "controls absent from a fresh snapshot return to neutral");
+    Assert(recon.HeldKeys.Count == 0,
+        "non-representable kinds do not fabricate keyboard state");
+
+    // --- Disconnect with held input cleans everything -------------------------
+    var sinkD = new TestInputSink();
+    var (s1, c1, l1, f1) = CreateSession(outputSink: sinkD);
+    DoHandshake(s1, c1);
+    c1.Emit(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(
+        new InputEventPayload(KeyButton("key:A", InputEventCodec.StateDown))), 2));
+    c1.Emit(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(
+        new InputEventPayload(MouseEvent("mouse:left", InputEventCodec.StateDown))), 3));
+    c1.Emit(MakeFrame(MessageType.Disconnect, DisconnectPayloadCodec.Encode(new DisconnectPayload(0)), 4, mustUnderstand: true));
+    Assert(sinkD.ReleaseAllCount == 1, "graceful disconnect with mixed held input releases once");
+    Assert(s1.State == ServerSessionState.Closed, "session closed cleanly");
+
+    // Transport failure mid-input also cleans up.
+    var sinkF = new TestInputSink();
+    var (s2, c2, l2, f2) = CreateSession(outputSink: sinkF);
+    DoHandshake(s2, c2);
+    c2.Emit(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(
+        new InputEventPayload(KeyButton("key:A", InputEventCodec.StateDown))), 2));
+    c2.EmitDisconnected("connection reset by peer");
+    Assert(sinkF.ReleaseAllCount == 1, "transport failure must release held input");
+    Assert(s2.State == ServerSessionState.Closed, "transport failure closes session");
+
+    // --- New session never inherits old input state ---------------------------
+    var perSessionSinks = new List<TestInputSink>();
+    TestInputSink SinkFactory()
+    {
+        var s = new TestInputSink();
+        perSessionSinks.Add(s);
+        return s;
+    }
+    var serverA = new TcpServer(0);
+    var hostA = new SessionHost(serverA, DefaultTestAuthenticator(), new RecordingSessionListener(),
+        null, null, SinkFactory);
+    _ = hostA.StartAsync();
+    await WaitUntil(() => hostA.IsListening);
+
+    // Session A holds an input, then dies abruptly.
+    var clientA = new TcpClient();
+    await clientA.ConnectAsync(IPAddress.Loopback, serverA.LocalPort);
+    var connA = new TcpConnection(clientA);
+    var framesA = new ConcurrentQueue<ProtocolFrame>();
+    connA.FrameReceived += f => framesA.Enqueue(f);
+    var runA = connA.RunAsync();
+    await connA.SendAsync(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    await WaitUntil(() => framesA.Count >= 1);
+    var welcomeA = WelcomePayloadCodec.Decode(framesA.First().Payload);
+    await connA.SendAsync(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("ctrl-42a8", welcomeA.Challenge)),
+        1, mustUnderstand: true));
+    await WaitUntil(() => perSessionSinks.Count >= 1 && hostA.Manager.IsActive("ctrl-42a8"));
+    await connA.SendAsync(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(
+        new InputEventPayload(KeyButton("key:A", InputEventCodec.StateDown))), 2));
+    await Task.Delay(80);
+    Assert(perSessionSinks[0].Inputs.Count == 1, "session A received its input via its own sink");
+    connA.CloseAsync().Wait();
+    await runA;
+    await WaitUntil(() => !hostA.Manager.IsActive("ctrl-42a8"));
+    Assert(perSessionSinks[0].ReleaseAllCount == 1, "session A sink released on disconnect");
+
+    // Session B gets its own brand-new neutral sink (fresh factory instance).
+    var clientB = new TcpClient();
+    await clientB.ConnectAsync(IPAddress.Loopback, serverA.LocalPort);
+    var connB = new TcpConnection(clientB);
+    var framesB = new ConcurrentQueue<ProtocolFrame>();
+    connB.FrameReceived += f => framesB.Enqueue(f);
+    var runB = connB.RunAsync();
+    await connB.SendAsync(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    await WaitUntil(() => framesB.Count >= 1 && perSessionSinks.Count >= 2);
+    var welcomeB = WelcomePayloadCodec.Decode(framesB.First().Payload);
+    await connB.SendAsync(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("ctrl-42a8", welcomeB.Challenge)),
+        1, mustUnderstand: true));
+    await WaitUntil(() => framesB.Count >= 2 &&
+        framesB.ToArray()[1].MessageType == MessageType.AuthOk);
+    // A real client sends the mandatory INPUT_SNAPSHOT right after AUTH_OK.
+    await connB.SendAsync(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(
+        new InputSnapshotPayload(new List<InputEvent>
+        {
+            new("b", InputEventCodec.KindButton,
+                InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial,
+                State: InputEventCodec.StateUp, PressCount: 0),
+        })), 2));
+    await WaitUntil(() => perSessionSinks.Count >= 2 &&
+        perSessionSinks[1].Snapshots.Count >= 1);
+    Assert(perSessionSinks[1].Inputs.Count == 0,
+        "session B starts with no inherited input events");
+    Assert(perSessionSinks[1].ReleaseAllCount == 0,
+        "session B sink starts unreleased and pristine");
+    await connB.CloseAsync();
+    await runB;
+    await hostA.StopAsync();
+
+    // --- Send failure diagnostics ----------------------------------------------
+    var failures = 0;
+    var failingSink = new Win32InputSink(_ => { failures++; return 0; }, motionLoopEnabled: false); // native send fails
+    failingSink.HandleInput(KeyButton("key:A", InputEventCodec.StateDown));
+    Assert(failingSink.FailedSendBatches == 1, "failed sends must be observable");
+    failingSink.ReleaseAll();
+    Assert(failingSink.HeldKeys.Count == 0, "release still clears logical state after send failure");
+    Assert(failingSink.FailedSendBatches == 2, "failed release batch is tracked too");
+    failingSink.ReleaseAll(); // repeated cleanup safe
+    Assert(failingSink.FailedSendBatches == 2, "idle ReleaseAll does not touch the failed-send counter");
+
+    Console.WriteLine("M2.3: input reliability smoke tests passed.");
 }
 
 sealed class TestData
@@ -2552,6 +2757,29 @@ sealed class IntegrationFlusher : IInputStateFlusher
     public void Flush()
     {
         Console.WriteLine("C#:FLUSH");
+        Console.Out.Flush();
+    }
+}
+
+/// <summary>M2.3: output sink for the integration server. Prints a RELEASED
+/// marker whenever the session's held input is flushed, proving the wire →
+/// decode → Session → IOutputSink cleanup path end-to-end.</summary>
+sealed class IntegrationOutputSink : CTRL.Desktop.Input.IOutputSink
+{
+    private int _released;
+    private int _inputCount;
+    private int _snapshotCount;
+    public int InputCount => Volatile.Read(ref _inputCount);
+    public int SnapshotCount => Volatile.Read(ref _snapshotCount);
+    public int ReleaseAllCount => Volatile.Read(ref _released);
+
+    public void HandleInput(InputEvent inputEvent) => Interlocked.Increment(ref _inputCount);
+    public void HandleSnapshot(InputSnapshotPayload snapshot) => Interlocked.Increment(ref _snapshotCount);
+    public void ReleaseAll()
+    {
+        if (Interlocked.Exchange(ref _released, 1) != 0)
+            return;
+        Console.WriteLine("C#:RELEASED");
         Console.Out.Flush();
     }
 }
