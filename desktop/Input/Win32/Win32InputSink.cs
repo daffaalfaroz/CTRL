@@ -77,9 +77,73 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
         }
     }
 
+    /// <summary>
+    /// Number of SendInput batches whose reported sent-count fell short of the
+    /// requested action count. Diagnostics only — logical state is always kept
+    /// consistent (releases clear state even when the native call fails), so a
+    /// failed send can never strand a stuck input silently (M2.3).
+    /// </summary>
+    public int FailedSendBatches { get; private set; }
+
     public void HandleInput(InputEvent input) => Apply(new[] { input });
 
-    public void HandleSnapshot(InputSnapshotPayload snapshot) => Apply(snapshot.Events);
+    /// <summary>
+    /// INPUT_SNAPSHOT is authoritative (docs/protocol.md §15: the payload
+    /// carries the FULL current control state). Reconciliation therefore:
+    ///   - presses every control held down by the snapshot,
+    ///   - releases any currently-held control the snapshot does not list,
+    ///   - resets motion/wheel axes the snapshot does not restate.
+    /// </summary>
+    public void HandleSnapshot(InputSnapshotPayload snapshot)
+    {
+        var events = snapshot.Events;
+        var instantActions = new List<Win32Output>(events.Count);
+        lock (_gate)
+        {
+            var snapshotKeys = new HashSet<ushort>();
+            var snapshotButtons = new HashSet<Win32MouseButton>();
+
+            foreach (var input in events)
+            {
+                var mapped = Win32InputMapper.Map(input);
+                switch (mapped.Kind)
+                {
+                    case Win32OutputKind.KeyDown:
+                        if (snapshotKeys.Add(mapped.VirtualKey) && _heldKeys.Add(mapped.VirtualKey))
+                            instantActions.Add(mapped);
+                        break;
+                    case Win32OutputKind.MouseDown:
+                        if (snapshotButtons.Add(mapped.MouseButton) && _heldButtons.Add(mapped.MouseButton))
+                            instantActions.Add(mapped);
+                        break;
+                    case Win32OutputKind.MoveVelocity:
+                        _moveVx = mapped.Fx;
+                        _moveVy = mapped.Fy;
+                        break;
+                    case Win32OutputKind.WheelVelocity:
+                        if (mapped.VirtualKey == Win32InputMapper.WheelDirectionUp)
+                            _wheelUpSpeed = mapped.Fx;
+                        else
+                            _wheelDownSpeed = mapped.Fx;
+                        break;
+                }
+            }
+
+            // Authoritative reconciliation: drop whatever the snapshot omits.
+            foreach (var vk in _heldKeys.Where(k => !snapshotKeys.Contains(k)).ToArray())
+            {
+                _heldKeys.Remove(vk);
+                instantActions.Add(Win32Output.Key(Win32OutputKind.KeyUp, vk, Win32InputMapper.IsExtended(vk)));
+            }
+            foreach (var button in _heldButtons.Where(b => !snapshotButtons.Contains(b)).ToArray())
+            {
+                _heldButtons.Remove(button);
+                instantActions.Add(Win32Output.Mouse(Win32OutputKind.MouseUp, button));
+            }
+        }
+        if (instantActions.Count > 0)
+            SendTracked(instantActions);
+    }
 
     /// <summary>
     /// One motion-loop iteration: converts stored stick velocity into relative
@@ -119,29 +183,56 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
             }
         }
         if (outputs.Count > 0)
-            _send(outputs);
+            SendTracked(outputs);
     }
 
+    /// <summary>Returns every output to neutral: keys, mouse buttons and
+    /// motion state (docs/protocol.md §16). Idempotent.</summary>
     public void ReleaseAll()
     {
-        List<Win32Output> releases;
+        ReleaseKeys();
+        ReleaseMouseButtons();
         lock (_gate)
         {
-            releases = new List<Win32Output>(
-                _heldKeys.Count + _heldButtons.Count);
-            foreach (var vk in _heldKeys)
-                releases.Add(Win32Output.Key(Win32OutputKind.KeyUp, vk, Win32InputMapper.IsExtended(vk)));
-            foreach (var button in _heldButtons)
-                releases.Add(Win32Output.Mouse(Win32OutputKind.MouseUp, button));
-            _heldKeys.Clear();
-            _heldButtons.Clear();
             // Motion state resets to neutral too (§16).
             _moveVx = _moveVy = 0;
             _wheelUpSpeed = _wheelDownSpeed = 0;
             _wheelUpAccum = _wheelDownAccum = 0;
         }
-        if (releases.Count > 0)
-            _send(releases);
+    }
+
+    /// <summary>Releases only held keyboard keys. Isolated from mouse state
+    /// (M2.3 reliability matrix); idempotent.</summary>
+    public void ReleaseKeys()
+    {
+        List<Win32Output> releases;
+        lock (_gate)
+        {
+            if (_heldKeys.Count == 0)
+                return;
+            releases = _heldKeys
+                .Select(vk => Win32Output.Key(Win32OutputKind.KeyUp, vk, Win32InputMapper.IsExtended(vk)))
+                .ToList();
+            _heldKeys.Clear();
+        }
+        SendTracked(releases);
+    }
+
+    /// <summary>Releases only held mouse buttons. Isolated from keyboard state;
+    /// idempotent.</summary>
+    public void ReleaseMouseButtons()
+    {
+        List<Win32Output> releases;
+        lock (_gate)
+        {
+            if (_heldButtons.Count == 0)
+                return;
+            releases = _heldButtons
+                .Select(b => Win32Output.Mouse(Win32OutputKind.MouseUp, b))
+                .ToList();
+            _heldButtons.Clear();
+        }
+        SendTracked(releases);
     }
 
     public void Dispose()
@@ -198,7 +289,16 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
             }
         }
         if (instantActions.Count > 0)
-            _send(instantActions);
+            SendTracked(instantActions);
+    }
+
+    /// <summary>Sends via the injected/native path and records shortfalls so a
+    /// failed batch is observable instead of silently pretending success.</summary>
+    private void SendTracked(IReadOnlyList<Win32Output> actions)
+    {
+        var sent = _send(actions);
+        if (sent < actions.Count)
+            FailedSendBatches++;
     }
 
     private static int NativeSend(IReadOnlyList<Win32Output> outputs)

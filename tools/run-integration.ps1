@@ -139,6 +139,7 @@ try {
     Require-Count $serverOut '^C#:TX:PONG:' 1 'sent PONG'
     Require-Count $serverOut '^C#:TX:ERROR:' 2 'protocol ERRORs sent (device-limit + unsupported-message)'
     Require-Count $serverOut '^C#:FLUSH' 3 'input-state flushes (graceful + takeover + violation)'
+    Require-Count $serverOut '^C#:RELEASED' 3 'output-sink ReleaseAll per closed session (M2.3)'
     Require-Count $serverOut '^C#:CLOSED:integration-device' 3 'closed sessions'
     Require-Zero $serverOut '^C#:TX:ACK' 'unsolicited ACKs (input/heartbeat must never be ACKed)'
     Require-Zero $serverErr '(?i)unhandled|exception' 'server runtime errors'
