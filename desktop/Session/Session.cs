@@ -1,3 +1,4 @@
+using CTRL.Desktop.Input;
 using CTRL.Desktop.Protocol;
 using CTRL.Desktop.Transport;
 
@@ -36,6 +37,7 @@ public sealed class Session
     private readonly IAuthenticator _authenticator;
     private readonly ISessionListener _listener;
     private readonly IInputStateFlusher? _flusher;
+    private readonly IOutputSink? _outputSink;
     private readonly SessionOptions _options;
     private SequenceTracker _outbound = new();
     private InboundSequenceTracker _inbound = new();
@@ -61,13 +63,15 @@ public sealed class Session
         IAuthenticator authenticator,
         ISessionListener listener,
         SessionOptions options,
-        IInputStateFlusher? flusher = null)
+        IInputStateFlusher? flusher = null,
+        IOutputSink? outputSink = null)
     {
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
         _authenticator = authenticator ?? throw new ArgumentNullException(nameof(authenticator));
         _listener = listener ?? throw new ArgumentNullException(nameof(listener));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _flusher = flusher;
+        _outputSink = outputSink;
         _ackTracker = new AckTracker(options.NowMs, options.AckTimeoutMs);
         _effectiveMajor = options.ProtocolMajor;
         _sessionId = (options.SessionIdFactory ?? NewSessionId)();
@@ -328,6 +332,20 @@ public sealed class Session
             return;
         }
         _listener.OnInputEvent(inputEvent);
+        // M2.0 boundary: the session forwards decoded events to the output
+        // sink without knowing the platform implementation (docs/protocol.md
+        // §18). A failing sink must never take the session down.
+        if (_outputSink is not null)
+        {
+            try
+            {
+                _outputSink.HandleInput(inputEvent);
+            }
+            catch (Exception ex)
+            {
+                _listener.OnError($"Output sink HandleInput failed: {ex.Message}");
+            }
+        }
     }
 
     private void HandleInputSnapshot(ProtocolFrame frame)
@@ -350,6 +368,17 @@ public sealed class Session
             return;
         }
         _listener.OnInputSnapshot(snapshot);
+        if (_outputSink is not null)
+        {
+            try
+            {
+                _outputSink.HandleSnapshot(snapshot);
+            }
+            catch (Exception ex)
+            {
+                _listener.OnError($"Output sink HandleSnapshot failed: {ex.Message}");
+            }
+        }
     }
 
     private void HandleHeartbeat(ProtocolFrame frame)
@@ -508,6 +537,7 @@ public sealed class Session
 
         SetState(terminal);
         _listener.OnError(reason);
+        ReleaseOutputsSafe();
         _flusher?.Flush();
         _ = CloseSafeAsync();
     }
@@ -536,9 +566,27 @@ public sealed class Session
 
         SetState(ServerSessionState.Closing);
         _listener.OnError($"Connection lost: {reason}");
+        ReleaseOutputsSafe();
         _flusher?.Flush();
         SetState(ServerSessionState.Closed);
         Closed?.Invoke(this);
+    }
+
+    /// <summary>§16 flush semantics for the output boundary: every virtual
+    /// output returns to neutral when the session ends. Guarded so a broken
+    /// sink cannot break session teardown.</summary>
+    private void ReleaseOutputsSafe()
+    {
+        if (_outputSink is null)
+            return;
+        try
+        {
+            _outputSink.ReleaseAll();
+        }
+        catch (Exception ex)
+        {
+            _listener.OnError($"Output sink ReleaseAll failed: {ex.Message}");
+        }
     }
 
     private void SetState(ServerSessionState state)
