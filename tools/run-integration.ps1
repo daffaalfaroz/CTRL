@@ -88,13 +88,19 @@ try {
     Write-Host "server listening on 127.0.0.1:$listenPort"
 
     # Run the Dart client against the real TCP server.
+    # Note: `dart run` may emit progress lines on STDERR ("Running build
+    # hooks..."); under PowerShell 5.1 with $ErrorActionPreference=Stop those
+    # become terminating NativeCommandErrors, so relax EAP for this call.
     Push-Location $mobileDir
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         $dartOutput = & $DartExe run tool/integration_client.dart --port $listenPort 2>&1
         $dartCode = $LASTEXITCODE
     }
     finally {
         Pop-Location
+        $ErrorActionPreference = $prevEap
     }
     foreach ($line in @($dartOutput)) { Write-Host ("  dart: " + [string]$line) }
 

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using CTRL.Desktop.Protocol;
 using CTRL.Desktop.Session;
 using CTRL.Desktop.Transport;
@@ -49,10 +50,15 @@ RunSessionHeartbeatTimeoutSmokeTests();
 RunSessionDisconnectFlushSmokeTests();
 RunSessionSnapshotBoundarySmokeTests();
 RunSessionSequenceBoundarySmokeTests();
+RunHmacVectorSmokeTests();
+RunRealAuthTokenLifecycleSmokeTests();
+RunPairingLifecycleSmokeTests();
+RunLockoutSmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
 Console.WriteLine("M1.4.3 session integration hardening smoke tests passed.");
+Console.WriteLine("M1.4.4 real authentication smoke tests passed.");
 return 0;
 
 static void RunFrameCodecSmokeTests()
@@ -1067,7 +1073,7 @@ static void RunSessionHandshakeSmokeTests()
     Assert(welcome.Challenge.SequenceEqual(TestData.Challenge), "challenge must be server-issued");
 
     conn.Emit(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", welcome.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("ctrl-42a8", welcome.Challenge)),
         1, mustUnderstand: true));
 
     Assert(session.State == ServerSessionState.Ready, "state must advance to Ready");
@@ -1227,6 +1233,8 @@ static void RunSessionAckSmokeTests()
 
 static void RunSessionAuthDeniedSmokeTests()
 {
+    // Wrong pairing code: HMAC is self-consistent but the code was never
+    // issued -> bad-credential.
     var (s1, c1, l1, f1) = CreateSession();
     c1.Emit(MakeFrame(MessageType.Hello,
         HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
@@ -1234,25 +1242,31 @@ static void RunSessionAuthDeniedSmokeTests()
     var welcome1 = WelcomePayloadCodec.Decode(c1.SentFrames[0].Payload);
 
     c1.Emit(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x02, "wrong", "ctrl-42a8", welcome1.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.PairingAuth("wrong", "ctrl-42a8", welcome1.Challenge)),
         1, mustUnderstand: true));
     Assert(c1.SentFrames[^1].MessageType == MessageType.AuthDenied, "bad credential must produce AUTH_DENIED");
     Assert(s1.State == ServerSessionState.Closed, "session must close after AUTH_DENIED");
     var denied = AuthDeniedPayloadCodec.Decode(c1.SentFrames[^1].Payload);
     Assert(denied.Reason == AuthDeniedPayloadCodec.ReasonBadCredential, "AUTH_DENIED reason must be bad-credential");
 
-    var (s2, c2, l2, f2) = CreateSession();
+    // Valid pairing code: accepted and issues a 32-byte persistent token.
+    var (s2, c2, l2, f2) = CreateSession(authenticator: new HmacAuthenticator(
+        AuthTestEnv.MasterKey,
+        new InMemoryTokenStore(),
+        AuthTestEnv.MakePairingService()));
     c2.Emit(MakeFrame(MessageType.Hello,
         HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
         0, mustUnderstand: true));
     var welcome2 = WelcomePayloadCodec.Decode(c2.SentFrames[0].Payload);
 
     c2.Emit(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x02, "123456", "ctrl-42a8", welcome2.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.PairingAuth(AuthTestEnv.PairingCode, "ctrl-42a8", welcome2.Challenge)),
         1, mustUnderstand: true));
     Assert(s2.State == ServerSessionState.Ready, "pairing-code auth must succeed");
     var ok = AuthOkPayloadCodec.Decode(c2.SentFrames[^1].Payload);
-    Assert(ok.NewToken.Length == 16, "pairing-code auth must issue a 16-byte token");
+    Assert(ok.NewToken.Length == 32, "pairing-code auth must issue a 32-byte token");
+    Assert(ok.NewToken.SequenceEqual(new HmacAuthenticator(AuthTestEnv.MasterKey).DeriveToken("ctrl-42a8")),
+        "issued token must be the deterministic device token");
 
     Console.WriteLine("M1.4.2: session auth-denied smoke tests passed.");
 }
@@ -1268,7 +1282,7 @@ static void RunSessionTakeoverSmokeTests()
         0, mustUnderstand: true));
     var w1 = WelcomePayloadCodec.Decode(c1.SentFrames[0].Payload);
     c1.Emit(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", w1.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("ctrl-42a8", w1.Challenge)),
         1, mustUnderstand: true));
     Assert(manager.ActiveCount == 1, "first session must be active");
 
@@ -1279,7 +1293,7 @@ static void RunSessionTakeoverSmokeTests()
         0, mustUnderstand: true));
     var w2 = WelcomePayloadCodec.Decode(c2.SentFrames[0].Payload);
     c2.Emit(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", w2.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("ctrl-42a8", w2.Challenge)),
         1, mustUnderstand: true));
 
     Assert(manager.ActiveCount == 1, "second session must replace the first");
@@ -1298,7 +1312,7 @@ static void RunSessionTakeoverSmokeTests()
 static async Task RunSessionLoopbackHostSmokeTests()
 {
     var server = new TcpServer(0);
-    var host = new SessionHost(server, new AuthenticatorStub(["ctrl-42a8"]), new RecordingSessionListener());
+    var host = new SessionHost(server, DefaultTestAuthenticator(), new RecordingSessionListener());
     var accepted = new ConcurrentQueue<Session>();
     host.SessionAccepted += s => accepted.Enqueue(s);
     _ = host.StartAsync();
@@ -1319,7 +1333,7 @@ static async Task RunSessionLoopbackHostSmokeTests()
     var welcome = WelcomePayloadCodec.Decode(frames.First().Payload);
 
     await transport.SendAsync(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", welcome.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("ctrl-42a8", welcome.Challenge)),
         1, mustUnderstand: true));
     await WaitUntil(() => frames.Count == 2);
     Assert(frames.Skip(1).First().MessageType == MessageType.AuthOk, "host must reply AUTH_OK");
@@ -1364,7 +1378,7 @@ static void RunSessionStateTransitionSmokeTests()
         0, mustUnderstand: true));
     Assert(s1.State == ServerSessionState.WaitAuth, "WaitHello -> WaitAuth");
     c1.Emit(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", "ctrl-42a8", TestData.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("ctrl-42a8", TestData.Challenge)),
         1, mustUnderstand: true));
     Assert(s1.State == ServerSessionState.Ready, "WaitAuth -> Ready");
     Assert(l1.States.SequenceEqual(new[]
@@ -1562,7 +1576,9 @@ static void RunSessionSnapshotBoundarySmokeTests()
     // Reconnect scenario: new session on the same device takes over; the old
     // one is closed + flushed and the new one carries its own snapshot.
     var manager = new SessionManager();
-    var trustedRe = new AuthenticatorStub(["ctrl-re"]);
+    var tokensRe = new InMemoryTokenStore();
+    var trustedRe = new HmacAuthenticator(AuthTestEnv.MasterKey, tokensRe);
+    tokensRe.StoreHash("ctrl-re", trustedRe.TokenHash("ctrl-re"));
     var (sA, cA, lA, fA) = CreateSession(authenticator: trustedRe);
     manager.Register(sA);
     DoHandshake(sA, cA, "ctrl-re");
@@ -1638,6 +1654,13 @@ static async Task<int> RunIntegrationServerAsync(int port)
     var manager = new SessionManager();
     var listener = new IntegrationListener();
     var flusher = new IntegrationFlusher();
+    // M1.4.4: real §12 authentication. The pairing code is pinned so the Dart
+    // integration client can pair deterministically; later phases reconnect
+    // with the issued (deterministic) token.
+    var pairing = new PairingCodeService(codeFactory: () => AuthTestEnv.PairingCode);
+    pairing.IssueExplicit(AuthTestEnv.PairingCode);
+    var authenticator = new HmacAuthenticator(
+        AuthTestEnv.MasterKey, new InMemoryTokenStore(), pairing);
     var options = new SessionOptions
     {
         SessionIdFactory = () => TestData.SessionId,
@@ -1649,7 +1672,7 @@ static async Task<int> RunIntegrationServerAsync(int port)
         var recording = new RecordingTransportConnection(connection);
         var session = new Session(
             recording,
-            new AuthenticatorStub(["integration-device"], "123456"),
+            authenticator,
             listener,
             options,
             flusher);
@@ -1697,7 +1720,7 @@ static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlu
     var flusher = new RecordingFlusher();
     var session = new Session(
         connection,
-        authenticator ?? new AuthenticatorStub(["ctrl-42a8"], "123456"),
+        authenticator ?? DefaultTestAuthenticator(),
         listener,
         new SessionOptions
         {
@@ -1716,7 +1739,7 @@ static WelcomePayload DoHandshake(Session session, FakeTransportConnection conn,
         0, mustUnderstand: true));
     var welcome = WelcomePayloadCodec.Decode(conn.SentFrames[^1].Payload);
     conn.Emit(MakeFrame(MessageType.Auth,
-        AuthPayloadCodec.Encode(new AuthPayload(0x01, "", deviceId, welcome.Challenge)),
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth(deviceId, welcome.Challenge)),
         1, mustUnderstand: true));
     if (session.State != ServerSessionState.Ready)
         throw new Exception("DoHandshake: session did not reach Ready.");
@@ -1724,16 +1747,17 @@ static WelcomePayload DoHandshake(Session session, FakeTransportConnection conn,
 }
 
 static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlusher) HandshakeToReady(
-    ulong now = 0, string deviceId = "ctrl-42a8", bool pairing = false, string credential = "")
+    ulong now = 0, string deviceId = "ctrl-42a8", bool pairing = false, string credential = "",
+    IAuthenticator? authenticator = null)
 {
-    var (session, conn, listener, flusher) = CreateSession(now);
+    var (session, conn, listener, flusher) = CreateSession(now, authenticator);
     conn.Emit(MakeFrame(MessageType.Hello,
         HelloPayloadCodec.Encode(new HelloPayload(deviceId, "0.1.0", 1, 0, 0x00000007)),
         0, mustUnderstand: true));
     var welcome = WelcomePayloadCodec.Decode(conn.SentFrames[^1].Payload);
     var auth = pairing
-        ? new AuthPayload(0x02, credential, deviceId, welcome.Challenge)
-        : new AuthPayload(0x01, "", deviceId, welcome.Challenge);
+        ? AuthTestEnv.PairingAuth(credential, deviceId, welcome.Challenge)
+        : AuthTestEnv.TokenAuth(deviceId, welcome.Challenge);
     conn.Emit(MakeFrame(MessageType.Auth, AuthPayloadCodec.Encode(auth), 1, mustUnderstand: true));
     if (session.State != ServerSessionState.Ready)
         throw new Exception("HandshakeToReady: session did not reach Ready.");
@@ -1775,6 +1799,261 @@ static void Assert(bool condition, string name)
         throw new Exception($"Assertion failed: {name}.");
 }
 
+/// <summary>Default authenticator for session suites: real HMAC with a fresh
+/// store pre-paired for ctrl-42a8.</summary>
+static IAuthenticator DefaultTestAuthenticator(string deviceId = "ctrl-42a8")
+{
+    var tokens = new InMemoryTokenStore();
+    var auth = new HmacAuthenticator(AuthTestEnv.MasterKey, tokens);
+    tokens.StoreHash(deviceId, auth.TokenHash(deviceId));
+    return auth;
+}
+
+// ---------------------------------------------------------------------------
+// M1.4.4 — real authentication (docs/protocol.md §12)
+// ---------------------------------------------------------------------------
+
+static void RunHmacVectorSmokeTests()
+{
+    // RFC 4231 test cases pinned as literals so the implementation is checked
+    // against the specification, not just against .NET's own HMAC class.
+    var rfc1 = AuthTestEnv.Hmac(
+        Enumerable.Repeat((byte)0x0b, 20).ToArray(),
+        Encoding.UTF8.GetBytes("Hi There"));
+    Assert(AuthTestEnv.Hex(rfc1) ==
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+        "RFC 4231 case 1 vector");
+
+    var rfc2 = AuthTestEnv.Hmac(
+        Encoding.UTF8.GetBytes("Jefe"),
+        Encoding.UTF8.GetBytes("what do ya want for nothing?"));
+    Assert(AuthTestEnv.Hex(rfc2) ==
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+        "RFC 4231 case 2 vector");
+
+    // Cross-language vectors: the Dart suite pins these exact literals too.
+    var challenge = Enumerable.Range(0, 32).Select(i => (byte)i).ToArray();
+    var cross = AuthTestEnv.Hmac(
+        Encoding.UTF8.GetBytes("ctrl-m144-cross-vector-secret"), challenge);
+    Assert(AuthTestEnv.Hex(cross) ==
+        "ce7542e18060a6367f4b393b7203b929bc5b2875d0a17f0be67e71a49210a23f",
+        "cross-language pairing-secret vector");
+    var tokenVector = AuthTestEnv.Hmac(
+        Encoding.UTF8.GetBytes("ctrl-m144-token-secret"), challenge);
+    Assert(AuthTestEnv.Hex(tokenVector) ==
+        "6a074159523a97c4e184ee965814fe428ece623530925f54a5ea6194bdd18945",
+        "cross-language token-secret vector");
+    Assert(cross.Length == 32 && tokenVector.Length == 32,
+        "challengeResponse must stay exactly 32 bytes");
+
+    // Authenticator-level negative path: a modified challenge is rejected.
+    var tokensNeg = new InMemoryTokenStore();
+    var authNeg = new HmacAuthenticator(AuthTestEnv.MasterKey, tokensNeg);
+    tokensNeg.StoreHash("neg-1", authNeg.TokenHash("neg-1"));
+    var (sN, cN, lN, fN) = CreateSession(authenticator: authNeg);
+    cN.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("neg-1", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var wN = WelcomePayloadCodec.Decode(cN.SentFrames[^1].Payload);
+    var mutated = (byte[])wN.Challenge.Clone();
+    mutated[0] ^= 0xFF;
+    cN.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(new AuthPayload(
+            AuthPayloadCodec.CredentialTypeToken, "", "neg-1",
+            HmacAuthenticator.HmacSha256(AuthTestEnv.TokenFor("neg-1"), mutated))),
+        1, mustUnderstand: true));
+    Assert(sN.State == ServerSessionState.Closed, "modified challenge must close the session");
+    Assert(cN.SentFrames[^1].MessageType == MessageType.AuthDenied &&
+        AuthDeniedPayloadCodec.Decode(cN.SentFrames[^1].Payload).Reason ==
+            AuthDeniedPayloadCodec.ReasonBadCredential,
+        "HMAC over a modified challenge must be rejected");
+
+    // A token-auth attempt for an unpaired device is rejected even with a
+    // self-consistent HMAC over that device's derived token.
+    var (sU, cU, lU, fU) = CreateSession();
+    cU.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("stranger", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var wU = WelcomePayloadCodec.Decode(cU.SentFrames[^1].Payload);
+    cU.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(AuthTestEnv.TokenAuth("stranger", wU.Challenge)),
+        1, mustUnderstand: true));
+    Assert(cU.SentFrames[^1].MessageType == MessageType.AuthDenied &&
+        AuthDeniedPayloadCodec.Decode(cU.SentFrames[^1].Payload).Reason ==
+            AuthDeniedPayloadCodec.ReasonBadCredential,
+        "unknown device token must be rejected");
+
+    Console.WriteLine("M1.4.4: HMAC vector smoke tests passed.");
+}
+
+static void RunRealAuthTokenLifecycleSmokeTests()
+{
+    var clock = new MutableClock { Value = 1000 };
+    var pairing = new PairingCodeService(nowMs: clock.Now);
+    pairing.IssueExplicit(AuthTestEnv.PairingCode);
+    var tokens = new InMemoryTokenStore();
+    var auth = new HmacAuthenticator(AuthTestEnv.MasterKey, tokens, pairing);
+
+    // Pairing success stores a HASH of the token — never the raw bytes.
+    var (sA, cA, lA, fA) = HandshakeToReady(authenticator: auth, pairing: true,
+        credential: AuthTestEnv.PairingCode);
+    var okA = AuthOkPayloadCodec.Decode(cA.SentFrames[^1].Payload);
+    Assert(okA.NewToken.Length == 32, "pairing must issue a 32-byte token");
+    Assert(tokens.TryGetHash("ctrl-42a8", out var storedHash), "token record must exist after pairing");
+    var rawToken = auth.DeriveToken("ctrl-42a8");
+    Assert(!storedHash.SequenceEqual(rawToken), "store must not contain the raw token");
+    Assert(storedHash.SequenceEqual(HmacAuthenticator.Sha256(rawToken)),
+        "store must contain SHA-256(token)");
+    Assert(okA.NewToken.SequenceEqual(rawToken), "issued token must equal the deterministic token");
+
+    // The issued token authenticates later reconnects; AUTH_OK has no newToken.
+    var (sB, cB, lB, fB) = HandshakeToReady(authenticator: auth);
+    var okB = AuthOkPayloadCodec.Decode(cB.SentFrames[^1].Payload);
+    Assert(okB.NewToken.Length == 0, "token reconnect must not issue a newToken");
+
+    // An invalid token (tampered response) is denied and counts as a failure.
+    var (sC, cC, lC, fC) = CreateSession(authenticator: auth);
+    cC.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var wC = WelcomePayloadCodec.Decode(cC.SentFrames[^1].Payload);
+    var tampered = AuthTestEnv.TokenAuth("ctrl-42a8", wC.Challenge);
+    tampered.ChallengeResponse[31] ^= 0x01;
+    cC.Emit(MakeFrame(MessageType.Auth, AuthPayloadCodec.Encode(tampered), 1, mustUnderstand: true));
+    Assert(cC.SentFrames[^1].MessageType == MessageType.AuthDenied,
+        "tampered token response must be denied");
+    Assert(sC.State == ServerSessionState.Closed, "denied session closes");
+
+    // After the failure the valid token still works (success resets the counter).
+    var (sD, _, _, _) = HandshakeToReady(authenticator: auth);
+    Assert(sD.State == ServerSessionState.Ready, "valid token works after a failure");
+
+    Console.WriteLine("M1.4.4: real-auth token lifecycle smoke tests passed.");
+}
+
+static void RunPairingLifecycleSmokeTests()
+{
+    var clock = new MutableClock { Value = 10_000 };
+    var pairing = new PairingCodeService(nowMs: clock.Now);
+    var auth = new HmacAuthenticator(AuthTestEnv.MasterKey, new InMemoryTokenStore(), pairing);
+
+    // Valid code accepted exactly once.
+    pairing.IssueExplicit("111111");
+    var (sOk, _, _, _) = HandshakeToReady(authenticator: auth, pairing: true, credential: "111111");
+    Assert(sOk.State == ServerSessionState.Ready, "valid pairing code must be accepted");
+
+    // Reuse of a consumed code is denied (single-use).
+    var (sReuse, cReuse, lReuse, fReuse) = CreateSession(authenticator: auth);
+    cReuse.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var wReuse = WelcomePayloadCodec.Decode(cReuse.SentFrames[^1].Payload);
+    cReuse.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(AuthTestEnv.PairingAuth("111111", "ctrl-42a8", wReuse.Challenge)),
+        1, mustUnderstand: true));
+    Assert(cReuse.SentFrames[^1].MessageType == MessageType.AuthDenied &&
+        AuthDeniedPayloadCodec.Decode(cReuse.SentFrames[^1].Payload).Reason ==
+            AuthDeniedPayloadCodec.ReasonBadCredential,
+        "consumed pairing code must be rejected");
+
+    // TTL boundary: still valid one tick before expiry.
+    clock.Value = 20_000;
+    pairing.IssueExplicit("222222"); // expires at 320_000
+    clock.Value = 319_999;
+    var (sTtl, _, _, _) = HandshakeToReady(authenticator: auth, pairing: true, credential: "222222");
+    Assert(sTtl.State == ServerSessionState.Ready, "code must be usable one tick before expiry");
+
+    // Expired exactly at expiresAt -> expired-code.
+    clock.Value = 30_000;
+    pairing.IssueExplicit("333333"); // expires at 330_000
+    clock.Value = 330_000;
+    var (sExp, cExp, lExp, fExp) = CreateSession(authenticator: auth);
+    cExp.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var wExp = WelcomePayloadCodec.Decode(cExp.SentFrames[^1].Payload);
+    cExp.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(AuthTestEnv.PairingAuth("333333", "ctrl-42a8", wExp.Challenge)),
+        1, mustUnderstand: true));
+    Assert(cExp.SentFrames[^1].MessageType == MessageType.AuthDenied &&
+        AuthDeniedPayloadCodec.Decode(cExp.SentFrames[^1].Payload).Reason ==
+            AuthDeniedPayloadCodec.ReasonExpiredCode,
+        "expired pairing code must yield expired-code");
+
+    // Unknown code never issued -> bad-credential.
+    var (sUnk, cUnk, lUnk, fUnk) = CreateSession(authenticator: auth);
+    cUnk.Emit(MakeFrame(MessageType.Hello,
+        HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+        0, mustUnderstand: true));
+    var wUnk = WelcomePayloadCodec.Decode(cUnk.SentFrames[^1].Payload);
+    cUnk.Emit(MakeFrame(MessageType.Auth,
+        AuthPayloadCodec.Encode(AuthTestEnv.PairingAuth("999999", "ctrl-42a8", wUnk.Challenge)),
+        1, mustUnderstand: true));
+    Assert(cUnk.SentFrames[^1].MessageType == MessageType.AuthDenied &&
+        AuthDeniedPayloadCodec.Decode(cUnk.SentFrames[^1].Payload).Reason ==
+            AuthDeniedPayloadCodec.ReasonBadCredential,
+        "unknown pairing code must yield bad-credential");
+
+    Console.WriteLine("M1.4.4: pairing lifecycle smoke tests passed.");
+}
+
+static void RunLockoutSmokeTests()
+{
+    const string ip = "203.0.113.9";
+    var clock = new MutableClock { Value = 50_000 };
+    var limiter = new AuthRateLimiter(maxFailures: 5, lockoutMs: 30_000, nowMs: clock.Now);
+    var pairing = new PairingCodeService(nowMs: clock.Now);
+    var auth = new HmacAuthenticator(AuthTestEnv.MasterKey, new InMemoryTokenStore(), pairing, limiter);
+
+    AuthResult Attempt(Func<string, byte[], AuthPayload> buildAuth)
+    {
+        var (_, conn, _, _) = CreateSession(authenticator: auth);
+        conn.RemoteAddress = ip;
+        conn.Emit(MakeFrame(MessageType.Hello,
+            HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
+            0, mustUnderstand: true));
+        var welcome = WelcomePayloadCodec.Decode(conn.SentFrames[^1].Payload);
+        return auth.Authenticate(buildAuth("ctrl-42a8", welcome.Challenge), welcome.Challenge, ip);
+    }
+
+    static AuthPayload BadPairing(string deviceId, byte[] challenge) =>
+        AuthTestEnv.PairingAuth("000001", deviceId, challenge); // consistent HMAC, unknown code
+
+    // Four failures: still allowed to try again.
+    for (var i = 0; i < 4; i++)
+    {
+        var result = Attempt(BadPairing);
+        Assert(!result.Accepted, $"failure {i + 1} must be denied");
+        Assert(!limiter.IsLocked(ip, "ctrl-42a8"), "lockout must not trigger before 5 failures");
+    }
+
+    // Fifth failure locks the key.
+    var fifth = Attempt(BadPairing);
+    Assert(!fifth.Accepted, "fifth failure must be denied");
+    Assert(limiter.IsLocked(ip, "ctrl-42a8"), "five failures must lock the key for 30 s");
+
+    // During the lockout window even VALID credentials are rejected...
+    clock.Value += 29_999;
+    pairing.IssueExplicit("777777");
+    var lockedValid = Attempt((deviceId, challenge) =>
+        AuthTestEnv.PairingAuth("777777", deviceId, challenge));
+    Assert(!lockedValid.Accepted, "valid credentials during lockout must be rejected");
+
+    // ...and the counter is per IP+deviceId: another address/device is free.
+    Assert(!limiter.IsLocked("198.51.100.7", "ctrl-42a8"), "other IPs must not inherit the lock");
+    Assert(!limiter.IsLocked(ip, "other-device"), "other devices must not inherit the lock");
+
+    // After the window a valid authentication succeeds again.
+    clock.Value += 1;
+    pairing.IssueExplicit("666666");
+    var recovered = Attempt((deviceId, challenge) =>
+        AuthTestEnv.PairingAuth("666666", deviceId, challenge));
+    Assert(recovered.Accepted, "after the 30 s window authentication works again");
+    Assert(!limiter.IsLocked(ip, "ctrl-42a8"), "success must clear the lockout state");
+
+    Console.WriteLine("M1.4.4: lockout smoke tests passed.");
+}
+
 sealed class TestData
 {
     public static readonly byte[] SessionId = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -1783,9 +2062,55 @@ sealed class TestData
     public static readonly byte[] Challenge = Enumerable.Range(0x10, 32).Select(i => (byte)i).ToArray();
 }
 
+/// <summary>
+/// M1.4.4 test environment for the real §12 authenticator: one pinned master
+/// key shared by every suite (and mirrored by the Dart tests), helpers to build
+/// wire-correct AUTH payloads, and a pre-paired default authenticator so the
+/// M1.4.2/M1.4.3 suites keep exercising token reconnects.
+/// </summary>
+static class AuthTestEnv
+{
+    /// <summary>32-byte deterministic master key (tests only; never a secret).</summary>
+    public static readonly byte[] MasterKey =
+        Enumerable.Range(0, 32).Select(i => (byte)(i + 1)).ToArray();
+
+    public const string PairingCode = "123456";
+
+    public static byte[] Hmac(byte[] key, byte[] data)
+    {
+        using var hmac = new System.Security.Cryptography.HMACSHA256(key);
+        return hmac.ComputeHash(data);
+    }
+
+    public static string Hex(byte[] bytes) =>
+        Convert.ToHexString(bytes).ToLowerInvariant();
+
+    /// <summary>The persistent token bytes for [deviceId] (deterministic).</summary>
+    public static byte[] TokenFor(string deviceId) => HmacAuthenticator.HmacSha256(
+        MasterKey,
+        Encoding.UTF8.GetBytes(HmacAuthenticator.TokenDerivationContext + deviceId));
+
+    /// <summary>Token-flow AUTH payload: empty credential + HMAC(token, challenge).</summary>
+    public static AuthPayload TokenAuth(string deviceId, byte[] challenge) =>
+        new(AuthPayloadCodec.CredentialTypeToken, "", deviceId, Hmac(TokenFor(deviceId), challenge));
+
+    /// <summary>Pairing-flow AUTH payload: code on the wire + HMAC(code, challenge).</summary>
+    public static AuthPayload PairingAuth(string code, string deviceId, byte[] challenge) =>
+        new(AuthPayloadCodec.CredentialTypePairingCode, code, deviceId,
+            Hmac(Encoding.UTF8.GetBytes(code), challenge));
+
+    public static PairingCodeService MakePairingService(Func<ulong>? nowMs = null, ulong ttlMs = PairingCodeService.DefaultTtlMs)
+    {
+        var pairing = new PairingCodeService(nowMs: nowMs, ttlMs: ttlMs);
+        pairing.IssueExplicit(PairingCode);
+        return pairing;
+    }
+}
+
 sealed class FakeTransportConnection : ITransportConnection
 {
     public bool IsConnected => Volatile.Read(ref _closed) == 0;
+    public string RemoteAddress { get; set; } = "test-ip";
     public List<byte[]> Sent { get; } = new();
     public List<ProtocolFrame> SentFrames { get; } = new();
     public event Action<ProtocolFrame>? FrameReceived;
@@ -1935,6 +2260,9 @@ sealed class RecordingTransportConnection : ITransportConnection
     }
 
     public bool IsConnected => _inner.IsConnected;
+
+    /// <inheritdoc />
+    public string RemoteAddress => _inner.RemoteAddress;
 
     public event Action<ProtocolFrame>? FrameReceived
     {

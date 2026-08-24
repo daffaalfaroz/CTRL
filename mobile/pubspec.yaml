@@ -35,8 +35,17 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
+  # Secure persistent storage for the device auth token (docs/protocol.md
+  # §12). Backed by Android Keystore (EncryptedSharedPreferences) on Android;
+  # approved as the single secure-storage dependency for M1.4.5.
+  flutter_secure_storage: ^9.2.4
+
 dev_dependencies:
   flutter_test:
+    sdk: flutter
+
+  # On-device end-to-end verification of secure token persistence (M1.4.5).
+  integration_test:
     sdk: flutter
 
   # The "flutter_lints" package below contains a set of recommended lints to

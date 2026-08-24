@@ -2,7 +2,6 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ctrl_mobile/protocol/auth_ok_payload.dart';
-import 'package:ctrl_mobile/protocol/auth_payload.dart';
 import 'package:ctrl_mobile/protocol/error_payload.dart';
 import 'package:ctrl_mobile/protocol/frame.dart';
 import 'package:ctrl_mobile/protocol/frame_builder.dart';
@@ -16,6 +15,7 @@ import 'package:ctrl_mobile/session/client_session.dart';
 import 'package:ctrl_mobile/session/input_snapshot_provider.dart';
 import 'package:ctrl_mobile/session/session_listener.dart';
 import 'package:ctrl_mobile/session/session_state.dart';
+import 'package:ctrl_mobile/session/token_store.dart';
 import 'package:ctrl_mobile/transport/tcp_transport.dart';
 import 'package:ctrl_mobile/transport/transport_connection.dart';
 
@@ -69,8 +69,12 @@ Future<void> main(List<String> args) async {
 
 Future<void> _run(String host, int port) async {
   const deviceId = 'integration-device';
+  // Pinned pairing code — the C# integration server issues exactly this one
+  // single-use code at startup (AuthTestEnv.PairingCode).
+  const pairingCode = '123456';
+  final tokenStore = InMemoryTokenStore();
 
-  // ---- Phase 1: happy path -------------------------------------------------
+  // ---- Phase 1: happy path (pairing) ---------------------------------------
   final tapA = _TapListener();
   final transportA = TcpTransport(port: port);
   await transportA.connect();
@@ -80,13 +84,11 @@ Future<void> _run(String host, int port) async {
   var clockA = 1000;
   final sessionA = ClientSession(
     transport: recordingA,
-    authenticator: const EchoAuthenticator(
-      credentialType: authCredentialTypeToken,
-      credential: '',
-      deviceId: deviceId,
-    ),
+    authenticator:
+        HmacAuthenticator.pairing(pairingCode: pairingCode, deviceId: deviceId),
     listener: tapA,
     inputSnapshotProvider: _IntegrationSnapshotProvider(),
+    tokenStore: tokenStore,
     nowMs: () => clockA,
   );
   sessionA.connect();
@@ -105,7 +107,7 @@ Future<void> _run(String host, int port) async {
   _expect(welcome.challenge.length == 32, 'WELCOME challenge is 32 bytes');
   _expect(welcome.authRequired, 'WELCOME authRequired is true');
 
-  // C# -> Dart: AUTH_OK echoes the WELCOME sessionId.
+  // C# -> Dart: AUTH_OK echoes the WELCOME sessionId and issues newToken.
   final authOkFrame =
       wireA.singleWhere((f) => f.messageType == MessageType.authOk);
   final authOk = AuthOkPayloadCodec.decode(authOkFrame.payload);
@@ -113,6 +115,24 @@ Future<void> _run(String host, int port) async {
       'AUTH_OK echoes the WELCOME sessionId');
   _expect(authOk.result == authOkResultOk, 'AUTH_OK result is ok');
   _expect(authOk.serverCapabilities != 0, 'AUTH_OK carries capabilities');
+  _expect(authOk.newToken.length == 32,
+      'pairing AUTH_OK issues a 32-byte newToken');
+  Uint8List? savedToken;
+  final persistDeadline =
+      DateTime.now().add(const Duration(seconds: 5));
+  while (savedToken == null) {
+    savedToken = await tokenStore.load(deviceId);
+    if (savedToken != null) {
+      break;
+    }
+    if (DateTime.now().isAfter(persistDeadline)) {
+      throw _IntegrationFailure('newToken persisted through the TokenStore');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  _expect(_bytesEqual(savedToken, authOk.newToken),
+      'client stored the issued newToken (§12)');
+  final tokenForReconnect = Uint8List.fromList(savedToken);
 
   // Dart -> C#: HELLO(0), AUTH(1), then the mandatory snapshot restarts at 0.
   _expect(recordingA.sentFrames.length == 3, 'three frames sent by phase 1');
@@ -174,20 +194,20 @@ Future<void> _run(String host, int port) async {
       label: 'transport A closed');
   _marker('phase1 graceful disconnect done');
 
-  // ---- Phase 2: reconnect --------------------------------------------------
+  // ---- Phase 2: reconnect with the issued token ----------------------------
   final tapB = _TapListener();
   final transportB = TcpTransport(port: port);
   await transportB.connect();
+  final wireB = <ProtocolFrame>[];
+  transportB.frames.listen(wireB.add);
   final recordingB = _RecordingTransport(transportB);
   final sessionB = ClientSession(
     transport: recordingB,
-    authenticator: const EchoAuthenticator(
-      credentialType: authCredentialTypeToken,
-      credential: '',
-      deviceId: deviceId,
-    ),
+    authenticator:
+        HmacAuthenticator.token(token: tokenForReconnect, deviceId: deviceId),
     listener: tapB,
     inputSnapshotProvider: _IntegrationSnapshotProvider(),
+    tokenStore: tokenStore,
   );
   sessionB.connect();
   await _waitFor(() => sessionB.state == ClientSessionState.ready,
@@ -195,6 +215,12 @@ Future<void> _run(String host, int port) async {
   _expect(recordingB.sentFrames[2].messageType == MessageType.inputSnapshot &&
           recordingB.sentFrames[2].sequence == 0,
       'reconnect resyncs with a fresh INPUT_SNAPSHOT at sequence 0');
+  // §12 A: a successful TOKEN auth never issues another newToken.
+  final authOkB = AuthOkPayloadCodec.decode(wireB
+      .singleWhere((f) => f.messageType == MessageType.authOk)
+      .payload);
+  _expect(authOkB.newToken.isEmpty,
+      'token-reconnect AUTH_OK must not carry newToken');
   _marker('phase2 reconnect ready');
 
   // ---- Phase 3: takeover ---------------------------------------------------
@@ -202,15 +228,15 @@ Future<void> _run(String host, int port) async {
   final transportC = TcpTransport(port: port);
   await transportC.connect();
   final recordingC = _RecordingTransport(transportC);
+  final wireC = <ProtocolFrame>[];
+  transportC.frames.listen(wireC.add);
   final sessionC = ClientSession(
     transport: recordingC,
-    authenticator: const EchoAuthenticator(
-      credentialType: authCredentialTypeToken,
-      credential: '',
-      deviceId: deviceId,
-    ),
+    authenticator:
+        HmacAuthenticator.token(token: tokenForReconnect, deviceId: deviceId),
     listener: tapC,
     inputSnapshotProvider: _IntegrationSnapshotProvider(),
+    tokenStore: tokenStore,
   );
   sessionC.connect();
   await _waitFor(() => sessionC.state == ClientSessionState.ready,

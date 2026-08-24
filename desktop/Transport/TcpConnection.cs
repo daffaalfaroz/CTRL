@@ -24,9 +24,22 @@ public sealed class TcpConnection : ITransportConnection
         _client = client ?? throw new ArgumentNullException(nameof(client));
         client.NoDelay = true;
         _stream = client.GetStream();
+        try
+        {
+            RemoteAddress =
+                (_client.Client.RemoteEndPoint as System.Net.IPEndPoint)?
+                    .Address.ToString() ?? string.Empty;
+        }
+        catch
+        {
+            RemoteAddress = string.Empty;
+        }
     }
 
     public bool IsConnected => Volatile.Read(ref _closed) == 0;
+
+    /// <inheritdoc />
+    public string RemoteAddress { get; }
 
     /// <summary>TCP_NODELAY state of the underlying socket (always enabled here).</summary>
     public bool NoDelay => _client.NoDelay;
