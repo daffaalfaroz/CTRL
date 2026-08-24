@@ -58,6 +58,7 @@ RunPairingLifecycleSmokeTests();
 RunLockoutSmokeTests();
 RunOutputSinkSmokeTests();
 RunWin32MapperSmokeTests();
+RunMouseSinkSmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
@@ -2245,6 +2246,134 @@ static void RunWin32MapperSmokeTests()
     Assert(sentActions.Count == beforeRelease + 2, "ReleaseAll must be idempotent when idle");
 
     Console.WriteLine("M2.0: win32 mapper smoke tests passed.");
+}
+
+// ---------------------------------------------------------------------------
+// M2.2 — mouse input (buttons, relative motion loop, wheel)
+// ---------------------------------------------------------------------------
+
+static void RunMouseSinkSmokeTests()
+{
+    static InputEvent MouseButton(string id, byte state, byte flags = InputEventCodec.FlagStateChanged) =>
+        new(id, InputEventCodec.KindButton, flags, State: state, PressCount: 1);
+
+    // --- Mapper: buttons ---------------------------------------------------
+    var leftDown = Win32InputMapper.Map(MouseButton("mouse:left", InputEventCodec.StateDown));
+    Assert(leftDown is { Kind: Win32OutputKind.MouseDown, MouseButton: Win32MouseButton.Left },
+        "mouse:left down maps to Left MouseDown");
+    var rightUp = Win32InputMapper.Map(MouseButton("mouse:right", InputEventCodec.StateUp));
+    Assert(rightUp is { Kind: Win32OutputKind.MouseUp, MouseButton: Win32MouseButton.Right },
+        "mouse:right up maps to Right MouseUp");
+    var middleDown = Win32InputMapper.Map(
+        MouseButton("mouse:middle", InputEventCodec.StateDown, InputEventCodec.FlagInitial));
+    Assert(middleDown is { Kind: Win32OutputKind.MouseDown, MouseButton: Win32MouseButton.Middle },
+        "initial-flag middle down maps as a press");
+
+    // Keyboard convention still wins for key: controlIds.
+    Assert(Win32InputMapper.Map(MouseButton("key:65", InputEventCodec.StateDown)).Kind
+        == Win32OutputKind.KeyDown, "keyboard mapping unaffected by mouse additions");
+
+    // --- Mapper: relative movement + wheel ---------------------------------
+    var move = Win32InputMapper.Map(new InputEvent(
+        "mouse:move", InputEventCodec.KindStick, 0, X: -0.5f, Y: 1.5f));
+    Assert(move is { Kind: Win32OutputKind.MoveVelocity, Fx: -0.5f }
+        && move.Fy <= 1.0f && move.Fy >= -1.0f,
+        "stick mouse:move maps to clamped velocity");
+
+    var wheelUp = Win32InputMapper.Map(new InputEvent(
+        "mouse:wheelup", InputEventCodec.KindAxis, InputEventCodec.FlagStateChanged, Value: 0.75f));
+    Assert(wheelUp is { Kind: Win32OutputKind.WheelVelocity, VirtualKey: Win32InputMapper.WheelDirectionUp }
+        && wheelUp.Fx > 0.74f && wheelUp.Fx < 0.76f,
+        "wheelup axis maps to up-direction velocity");
+
+    var gamepadStick = Win32InputMapper.Map(new InputEvent(
+        "look", InputEventCodec.KindStick, 0, X: 0.9f, Y: 0.9f));
+    Assert(gamepadStick.Kind == Win32OutputKind.None,
+        "non-mouse stick maps to None");
+
+    // --- Sink: held buttons + ReleaseAll ------------------------------------
+    var sent = new List<Win32Output>();
+    var sink = new Win32InputSink(actions => { sent.AddRange(actions); return actions.Count; }, motionLoopEnabled: false);
+    sink.HandleInput(MouseButton("mouse:left", InputEventCodec.StateDown));
+    sink.HandleInput(MouseButton("mouse:left", InputEventCodec.StateDown)); // duplicate ignored
+    sink.HandleInput(MouseButton("mouse:right", InputEventCodec.StateDown));
+    Assert(sink.HeldButtons.Count == 2 &&
+           sink.HeldButtons.Contains(Win32MouseButton.Left) &&
+           sink.HeldButtons.Contains(Win32MouseButton.Right),
+        "held-button tracking records distinct buttons");
+    sink.HandleInput(MouseButton("mouse:left", InputEventCodec.StateUp));
+    Assert(sink.HeldButtons.Count == 1 &&
+           sent.Count(a => a is { Kind: Win32OutputKind.MouseUp, MouseButton: Win32MouseButton.Left }) == 1,
+        "button up releases exactly one held button");
+    var beforeReleaseAll = sent.Count;
+    sink.ReleaseAll();
+    Assert(sink.HeldButtons.Count == 0,
+        "ReleaseAll releases remaining mouse buttons");
+    Assert(sent.Skip(beforeReleaseAll)
+               .Any(a => a is { Kind: Win32OutputKind.MouseUp, MouseButton: Win32MouseButton.Right }),
+        "ReleaseAll sent the right-button up");
+    sink.ReleaseAll();
+    Assert(sent.Count == beforeReleaseAll + 1, "ReleaseAll idempotent when idle");
+
+    // --- Sink: deterministic motion loop -------------------------------------
+    var motionSent = new List<Win32Output>();
+    var motionSink = new Win32InputSink(actions => { motionSent.AddRange(actions); return actions.Count; }, motionLoopEnabled: false);
+    motionSink.HandleInput(new InputEvent(
+        "mouse:move", InputEventCodec.KindStick, InputEventCodec.FlagStateChanged, X: 1.0f, Y: 0.0f));
+    motionSink.PumpTick();
+    var moveActions = motionSent.Where(a => a.Kind == Win32OutputKind.MoveVelocity).ToList();
+    Assert(moveActions.Count == 1 && moveActions[0].Fx > 0,
+        "full-deflection stick produces rightward cursor delta");
+    // Center the stick: motion stops.
+    motionSink.HandleInput(new InputEvent(
+        "mouse:move", InputEventCodec.KindStick, InputEventCodec.FlagStateChanged, X: 0.0f, Y: 0.0f));
+    var countAfterCenter = motionSent.Count;
+    motionSink.PumpTick();
+    motionSink.PumpTick();
+    Assert(motionSent.Count == countAfterCenter,
+        "centered stick stops cursor motion");
+    // ReleaseAll clears any residual motion state.
+    motionSink.HandleInput(new InputEvent(
+        "mouse:move", InputEventCodec.KindStick, InputEventCodec.FlagStateChanged, X: 1.0f, Y: 0.0f));
+    motionSink.ReleaseAll();
+    var countAfterRelease = motionSent.Count;
+    motionSink.PumpTick();
+    Assert(motionSent.Count == countAfterRelease,
+        "ReleaseAll clears motion velocity (§16)");
+
+    // --- Wheel accumulation ---------------------------------------------------
+    var wheelSent = new List<Win32Output>();
+    var wheelSink = new Win32InputSink(actions => { wheelSent.AddRange(actions); return actions.Count; }, motionLoopEnabled: false);
+    wheelSink.HandleInput(new InputEvent(
+        "mouse:wheelup", InputEventCodec.KindAxis, InputEventCodec.FlagStateChanged, Value: 1.0f));
+    for (var i = 0; i < 11; i++)
+        wheelSink.PumpTick(); // 6 notches/sec @16ms -> ~0.096/tick; 11 ticks >= 1 notch
+    var ups = wheelSent.Count(a => a.Kind == Win32OutputKind.WheelVelocity
+        && a.VirtualKey == Win32InputMapper.WheelDirectionUp);
+    Assert(ups >= 1, "sustained wheelup produces at least one notch");
+    Assert(ups <= 2, "notch rate stays bounded (no runaway accumulation)");
+    wheelSink.ReleaseAll();
+    var upsAfterRelease = wheelSent.Count(a => a.Kind == Win32OutputKind.WheelVelocity);
+    for (var i = 0; i < 20; i++)
+        wheelSink.PumpTick();
+    Assert(wheelSent.Count(a => a.Kind == Win32OutputKind.WheelVelocity) == upsAfterRelease,
+        "ReleaseAll clears wheel accumulators");
+
+    // --- Session integration: snapshot with initial mouse press reaches sink --
+    var sessionSink = new TestInputSink();
+    var (sM, cM, lM, fM) = CreateSession(outputSink: sessionSink);
+    DoHandshake(sM, cM);
+    cM.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(
+        new InputSnapshotPayload(new List<InputEvent>
+        {
+            MouseButton("mouse:left", InputEventCodec.StateDown,
+                InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial),
+        })), 2));
+    Assert(sessionSink.Snapshots.Count == 1 &&
+           sessionSink.Snapshots[0].Events[0].ControlId == "mouse:left",
+        "snapshot carrying a mouse button reaches the output sink");
+
+    Console.WriteLine("M2.2: mouse input smoke tests passed.");
 }
 
 sealed class TestData

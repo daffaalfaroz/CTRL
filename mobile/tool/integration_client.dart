@@ -175,12 +175,28 @@ Future<void> _run(String host, int port) async {
     state: inputEventStateDown,
     pressCount: 1,
   ));
+  sessionA.sendInputEvent(const InputEvent(
+    controlId: 'mouse:left',
+    kind: inputEventKindButton,
+    flags: inputEventFlagStateChanged,
+    state: inputEventStateDown,
+    pressCount: 1,
+  ));
+  sessionA.sendInputEvent(const InputEvent(
+    controlId: 'mouse:left',
+    kind: inputEventKindButton,
+    flags: inputEventFlagStateChanged,
+    state: inputEventStateUp,
+    pressCount: 1,
+  ));
   await sessionA.waitForIdle();
-  _expect(recordingA.sentFrames.length == 6, 'three INPUT_EVENTs appended');
+  _expect(recordingA.sentFrames.length == 8, 'five INPUT_EVENTs appended');
   _expect(recordingA.sentFrames[3].sequence == 1 &&
       recordingA.sentFrames[4].sequence == 2 &&
-      recordingA.sentFrames[5].sequence == 3,
-      'post-auth sequences increment 1, 2, 3');
+      recordingA.sentFrames[5].sequence == 3 &&
+      recordingA.sentFrames[6].sequence == 4 &&
+      recordingA.sentFrames[7].sequence == 5,
+      'post-auth sequences increment 1..5');
   _marker('phase1 events sent');
 
   // Heartbeat -> PONG echo (§10): PONG is not an ACK.
