@@ -47,7 +47,7 @@ public sealed class Win32InputSink : IOutputSink
             if (_heldKeys.Count == 0)
                 return;
             releases = _heldKeys
-                .Select(vk => new Win32Output(Win32OutputKind.KeyUp, vk))
+                .Select(vk => new Win32Output(Win32OutputKind.KeyUp, vk, Win32InputMapper.IsExtended(vk)))
                 .ToList();
             _heldKeys.Clear();
         }
@@ -84,6 +84,12 @@ public sealed class Win32InputSink : IOutputSink
         var inputs = new NativeMethods.INPUT[outputs.Count];
         for (var i = 0; i < outputs.Count; i++)
         {
+            uint flags = 0;
+            if (outputs[i].Kind == Win32OutputKind.KeyUp)
+                flags |= NativeMethods.KEYEVENTF_KEYUP;
+            if (outputs[i].Extended)
+                flags |= NativeMethods.KEYEVENTF_EXTENDEDKEY;
+
             inputs[i] = new NativeMethods.INPUT
             {
                 type = NativeMethods.INPUT_KEYBOARD,
@@ -92,9 +98,7 @@ public sealed class Win32InputSink : IOutputSink
                     ki = new NativeMethods.KEYBDINPUT
                     {
                         wVk = (ushort)outputs[i].VirtualKey,
-                        dwFlags = outputs[i].Kind == Win32OutputKind.KeyUp
-                            ? NativeMethods.KEYEVENTF_KEYUP
-                            : 0,
+                        dwFlags = flags,
                     },
                 },
             };
@@ -108,6 +112,7 @@ public sealed class Win32InputSink : IOutputSink
     {
         public const uint INPUT_KEYBOARD = 1;
         public const uint KEYEVENTF_KEYUP = 0x0002;
+        public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
