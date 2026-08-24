@@ -15,6 +15,21 @@ public enum Win32OutputKind
 
     /// <summary>Stateful: axis value feeds the wheel notch accumulator.</summary>
     WheelVelocity,
+
+    /// <summary>Stateful: abstract-gamepad button press (M2.4, CAP_GAMEPAD).</summary>
+    GamepadButtonDown,
+
+    /// <summary>Stateful: abstract-gamepad button release (M2.4).</summary>
+    GamepadButtonUp,
+
+    /// <summary>Stateful: gamepad stick position, Fx/Fy = x/y (M2.4).</summary>
+    GamepadStickState,
+
+    /// <summary>Stateful: gamepad trigger value, Fx = 0..1 (M2.4).</summary>
+    GamepadTriggerState,
+
+    /// <summary>Stateful: gamepad hat/d-pad raw value, VirtualKey = hat (M2.4).</summary>
+    GamepadHatState,
 }
 
 /// <summary>Mouse buttons recognized by the CTRL binding (M2.2).</summary>
@@ -27,6 +42,25 @@ public enum Win32MouseButton
 }
 
 /// <summary>
+/// Abstract gamepad buttons recognized by the CTRL binding (M2.4). Names are
+/// layout-agnostic; the desktop owns any mapping to real outputs.
+/// </summary>
+public enum Win32GamepadButton
+{
+    None = 0,
+    A = 1,
+    B = 2,
+    X = 3,
+    Y = 4,
+    LeftShoulder = 5,
+    RightShoulder = 6,
+    Back = 7,
+    Start = 8,
+    LeftStickClick = 9,
+    RightStickClick = 10,
+}
+
+/// <summary>
 /// A single mapped output action for the Win32 platform layer.
 /// Flat struct with kind-dependent fields (documented per <see cref="Kind"/>):
 ///   KeyDown/KeyUp        → VirtualKey (+ Extended)
@@ -34,23 +68,31 @@ public enum Win32MouseButton
 ///   MoveVelocity         → Fx/Fy = normalized velocity components (-1..1)
 ///   WheelVelocity        → Fx = speed (0..1), VirtualKey = direction
 ///                          (0x01 up / 0xFF down — see TryMapWheelDirection)
+///   GamepadButtonDown/Up → GamepadButton
+///   GamepadStickState    → GamepadButton = stick id, Fx/Fy = x/y (-1..1)
+///   GamepadTriggerState  → GamepadButton = trigger id, Fx = value (0..1)
+///   GamepadHatState      → VirtualKey = hat raw value 0..8
 /// </summary>
 public readonly record struct Win32Output(
     Win32OutputKind Kind,
-    ushort VirtualKey,
-    bool Extended,
-    Win32MouseButton MouseButton,
-    float Fx,
-    float Fy)
+    ushort VirtualKey = 0,
+    bool Extended = false,
+    Win32MouseButton MouseButton = Win32MouseButton.None,
+    Win32GamepadButton GamepadButton = Win32GamepadButton.None,
+    float Fx = 0,
+    float Fy = 0)
 {
     /// <summary>Event carries nothing this sink can act on.</summary>
     public static Win32Output None => default;
 
     public static Win32Output Key(Win32OutputKind kind, ushort vk, bool extended) =>
-        new(kind, vk, extended, Win32MouseButton.None, 0, 0);
+        new(kind, vk, extended, Win32MouseButton.None, Win32GamepadButton.None, 0, 0);
 
     public static Win32Output Mouse(Win32OutputKind kind, Win32MouseButton button) =>
-        new(kind, 0, false, button, 0, 0);
+        new(kind, 0, false, button, Win32GamepadButton.None, 0, 0);
+
+    public static Win32Output Gamepad(Win32OutputKind kind, Win32GamepadButton button, float fx = 0, float fy = 0) =>
+        new(kind, 0, false, Win32MouseButton.None, button, fx, fy);
 }
 
 /// <summary>
@@ -163,17 +205,136 @@ public static class Win32InputMapper
             case InputEventCodec.KindButton:
                 return MapButton(input);
             case InputEventCodec.KindStick:
-                return MapStick(input);
+            {
+                var gamepad = MapGamepadStick(input);
+                return gamepad.Kind != Win32OutputKind.None ? gamepad : MapStick(input);
+            }
             case InputEventCodec.KindAxis:
                 return MapWheelAxis(input);
+            case InputEventCodec.KindTrigger:
+                return MapGamepadTrigger(input);
+            case InputEventCodec.KindHat:
+                return MapGamepadHat(input);
             default:
-                // Trigger/hat mappings are outside M2.2 scope.
                 return Win32Output.None;
         }
     }
 
+    // --- M2.4: abstract gamepad (docs/protocol.md §8/§9, CAP_GAMEPAD) -------
+
+    /// <summary>Canonical gamepad controlIds (application-level convention,
+    /// mirroring key:/mouse:/ — the wire format is untouched).</summary>
+    public const string GpA = "gamepad:a";
+    public const string GpB = "gamepad:b";
+    public const string GpX = "gamepad:x";
+    public const string GpY = "gamepad:y";
+    public const string GpLeftShoulder = "gamepad:lb";
+    public const string GpRightShoulder = "gamepad:rb";
+    public const string GpBack = "gamepad:back";
+    public const string GpStart = "gamepad:start";
+    public const string GpLeftStickClick = "gamepad:lsclick";
+    public const string GpRightStickClick = "gamepad:rsclick";
+    public const string GpLeftStick = "gamepad:lstick";
+    public const string GpRightStick = "gamepad:rstick";
+    public const string GpLeftTrigger = "gamepad:lt";
+    public const string GpRightTrigger = "gamepad:rt";
+    public const string GpDpad = "gamepad:dpad";
+
+    private static readonly Dictionary<string, Win32GamepadButton> GamepadButtons =
+        new(StringComparer.Ordinal)
+        {
+            [GpA] = Win32GamepadButton.A,
+            [GpB] = Win32GamepadButton.B,
+            [GpX] = Win32GamepadButton.X,
+            [GpY] = Win32GamepadButton.Y,
+            [GpLeftShoulder] = Win32GamepadButton.LeftShoulder,
+            [GpRightShoulder] = Win32GamepadButton.RightShoulder,
+            [GpBack] = Win32GamepadButton.Back,
+            [GpStart] = Win32GamepadButton.Start,
+            [GpLeftStickClick] = Win32GamepadButton.LeftStickClick,
+            [GpRightStickClick] = Win32GamepadButton.RightStickClick,
+        };
+
+    private static Win32Output MapGamepadButton(InputEvent input)
+    {
+        if (!GamepadButtons.TryGetValue(input.ControlId, out var button))
+            return Win32Output.None;
+        if ((input.Flags & (InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial)) == 0)
+            return Win32Output.None;
+        return input.State == InputEventCodec.StateDown
+            ? Win32Output.Gamepad(Win32OutputKind.GamepadButtonDown, button)
+            : Win32Output.Gamepad(Win32OutputKind.GamepadButtonUp, button);
+    }
+
+    private const ushort StickIdLeft = 1;
+    private const ushort StickIdRight = 2;
+    private const ushort TriggerIdLeft = 1;
+    private const ushort TriggerIdRight = 2;
+
+    private static Win32Output MapGamepadStick(InputEvent input)
+    {
+        var stickId = input.ControlId switch
+        {
+            GpLeftStick => StickIdLeft,
+            GpRightStick => StickIdRight,
+            _ => (ushort)0,
+        };
+        if (stickId == 0)
+            return Win32Output.None;
+        // §9: values outside -1..1 are clamped; non-finite is dropped (§18).
+        var x = input.X ?? 0;
+        var y = input.Y ?? 0;
+        if (!IsFinite(x) || !IsFinite(y))
+            return Win32Output.None;
+        return new Win32Output(Win32OutputKind.GamepadStickState, stickId, false,
+            Win32MouseButton.None, Fx: Clamp11(x), Fy: Clamp11(y));
+    }
+
+    /// <summary>Gamepad stick positions currently held/tracked:
+    /// VirtualKey = stick id (see <see cref="Win32InputSink.GamepadSticks"/>).</summary>
+    private static Win32Output MapGamepadTrigger(InputEvent input)
+    {
+        var triggerId = input.ControlId switch
+        {
+            GpLeftTrigger => TriggerIdLeft,
+            GpRightTrigger => TriggerIdRight,
+            _ => (ushort)0,
+        };
+        if (triggerId == 0)
+            return Win32Output.None;
+        var value = input.Value ?? 0;
+        if (!IsFinite(value))
+            return Win32Output.None;
+        // §9: normalized 0..1.
+        return new Win32Output(Win32OutputKind.GamepadTriggerState, triggerId, false,
+            Win32MouseButton.None, Fx: Math.Clamp(value, 0f, 1f));
+    }
+
+    private static Win32Output MapGamepadHat(InputEvent input)
+    {
+        if (!string.Equals(input.ControlId, GpDpad, StringComparison.Ordinal))
+            return Win32Output.None;
+        // §9: hat raw 0..8; out-of-range input-plane events are dropped (§18).
+        if (input.HatValue is < 0 or > 8)
+            return Win32Output.None;
+        return new Win32Output(Win32OutputKind.GamepadHatState, (ushort)(input.HatValue ?? 0),
+            false, Win32MouseButton.None, Win32GamepadButton.None, 0, 0);
+    }
+
+    private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
+
     private static Win32Output MapButton(InputEvent input)
     {
+        var gp = TryMapGamepadButton(input.ControlId);
+        if (gp is not null)
+        {
+            if ((input.Flags & (InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial)) == 0)
+                return Win32Output.None;
+            return input.State == InputEventCodec.StateDown
+                ? Win32Output.Gamepad(Win32OutputKind.GamepadButtonDown, gp.Value)
+                : Win32Output.Gamepad(Win32OutputKind.GamepadButtonUp, gp.Value);
+        }
+
         var button = TryMapMouseButton(input.ControlId);
         if (button is null)
             return MapKey(input);
@@ -183,6 +344,9 @@ public static class Win32InputMapper
             ? Win32Output.Mouse(Win32OutputKind.MouseDown, button.Value)
             : Win32Output.Mouse(Win32OutputKind.MouseUp, button.Value);
     }
+
+    private static Win32GamepadButton? TryMapGamepadButton(string controlId) =>
+        GamepadButtons.TryGetValue(controlId, out var button) ? button : null;
 
     private static Win32Output MapKey(InputEvent input)
     {
@@ -205,7 +369,7 @@ public static class Win32InputMapper
         if (!string.Equals(input.ControlId, MoveControlId, StringComparison.OrdinalIgnoreCase))
             return Win32Output.None;
         return new Win32Output(Win32OutputKind.MoveVelocity, 0, false,
-            Win32MouseButton.None, Clamp11(input.X ?? 0), Clamp11(input.Y ?? 0));
+            Win32MouseButton.None, Win32GamepadButton.None, Clamp11(input.X ?? 0), Clamp11(input.Y ?? 0));
     }
 
     /// <summary>Axis "mouse:wheelup"/"mouse:wheeldown" (0..1) drives wheel notch rate.</summary>
@@ -216,7 +380,7 @@ public static class Win32InputMapper
             return Win32Output.None;
         var speed = Math.Clamp((double)(input.Value ?? 0), 0.0, 1.0);
         return new Win32Output(Win32OutputKind.WheelVelocity, (ushort)dir.Value, false,
-            Win32MouseButton.None, (float)speed, 0);
+            Win32MouseButton.None, Win32GamepadButton.None, (float)speed, 0);
     }
 
     public const string MoveControlId = "mouse:move";
