@@ -154,7 +154,7 @@ Future<void> _run(String host, int port) async {
           .every((e) => (e.flags & inputEventFlagInitial) != 0),
       'every snapshot entry sets the initial flag');
 
-  // Dart -> C# hot path: one button event and one axis event.
+  // Dart -> C# hot path: button, trigger, and a M2.1 keyboard key event.
   sessionA.sendInputEvent(const InputEvent(
     controlId: 'btn-fire',
     kind: inputEventKindButton,
@@ -168,11 +168,19 @@ Future<void> _run(String host, int port) async {
     flags: inputEventFlagStateChanged,
     value: 0.5,
   ));
+  sessionA.sendInputEvent(const InputEvent(
+    controlId: 'key:A',
+    kind: inputEventKindButton,
+    flags: inputEventFlagStateChanged,
+    state: inputEventStateDown,
+    pressCount: 1,
+  ));
   await sessionA.waitForIdle();
-  _expect(recordingA.sentFrames.length == 5, 'two INPUT_EVENTs appended');
+  _expect(recordingA.sentFrames.length == 6, 'three INPUT_EVENTs appended');
   _expect(recordingA.sentFrames[3].sequence == 1 &&
-      recordingA.sentFrames[4].sequence == 2,
-      'post-auth sequences increment 1, 2');
+      recordingA.sentFrames[4].sequence == 2 &&
+      recordingA.sentFrames[5].sequence == 3,
+      'post-auth sequences increment 1, 2, 3');
   _marker('phase1 events sent');
 
   // Heartbeat -> PONG echo (§10): PONG is not an ACK.

@@ -2169,6 +2169,54 @@ static void RunWin32MapperSmokeTests()
     Assert(Win32InputMapper.Map(axis).Kind == Win32OutputKind.None,
         "axis events are outside M2.0 scope and map to None");
 
+    // --- M2.1: named keys, modifiers, extended keys, combinations -----------
+    Assert(Win32InputMapper.Map(Button("key:A", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged))
+        is { Kind: Win32OutputKind.KeyDown, VirtualKey: 65, Extended: false },
+        "named letter key maps to its ASCII VK");
+    Assert(Win32InputMapper.Map(Button("key:f5", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged))
+        is { Kind: Win32OutputKind.KeyDown, VirtualKey: 0x74 },
+        "function-key names are case-insensitive");
+    Assert(Win32InputMapper.Map(Button("KEY:LCONTROL", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged))
+        is { Kind: Win32OutputKind.KeyDown, VirtualKey: 0xA2 },
+        "modifier names resolve (case-insensitive)");
+
+    var left = Win32InputMapper.Map(Button("key:LEFT", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged));
+    Assert(left is { Kind: Win32OutputKind.KeyDown, VirtualKey: 0x25, Extended: true },
+        "arrow keys require the extended-key flag");
+
+    var rctrlUp = Win32InputMapper.Map(Button("key:RCONTROL", InputEventCodec.StateUp, InputEventCodec.FlagStateChanged));
+    Assert(rctrlUp is { Kind: Win32OutputKind.KeyUp, VirtualKey: 0xA3, Extended: true },
+        "right control maps as an extended key-up");
+
+    // Combination flow through the sink: LCONTROL down, C down, C up, LCONTROL
+    // up — held set tracks the chord, ReleaseAll clears the remainder.
+    var sent = new List<Win32Output>();
+    var chordSink = new Win32InputSink(actions => { sent.AddRange(actions); return actions.Count; });
+    chordSink.HandleInput(Button("key:RCONTROL", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged));
+    chordSink.HandleInput(Button("key:C", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged));
+    Assert(new HashSet<ushort>(chordSink.HeldKeys).SetEquals(new[] { (ushort)0xA3, (ushort)0x43 }),
+        "combination holds both modifier and key");
+    chordSink.HandleInput(Button("key:C", InputEventCodec.StateUp, InputEventCodec.FlagStateChanged));
+    Assert(new HashSet<ushort>(chordSink.HeldKeys).SetEquals(new[] { (ushort)0xA3 }),
+        "releasing one key keeps the modifier held");
+    chordSink.ReleaseAll();
+    Assert(chordSink.HeldKeys.Count == 0, "emergency release empties all held keys");
+    Assert(sent.Count(a => a.Kind == Win32OutputKind.KeyDown) == 2 &&
+           sent.Count(a => a.Kind == Win32OutputKind.KeyUp) == 2,
+        "every down/up reaches SendInput exactly once (no duplicate sends)");
+    Assert(sent.Any(a => a is { Kind: Win32OutputKind.KeyUp, VirtualKey: 0xA3, Extended: true }),
+        "release path preserves the extended flag for RCTRL-class keys");
+
+    // Emergency release also works when only modifiers are stuck.
+    chordSink.HandleInput(Button("key:LSHIFT", InputEventCodec.StateDown, InputEventCodec.FlagInitial));
+    Assert(chordSink.HeldKeys.Count == 1, "modifier re-hold registers");
+    chordSink.ReleaseAll();
+    Assert(chordSink.HeldKeys.Count == 0, "stuck modifier released by emergency release");
+
+    // Unknown names stay None.
+    Assert(Win32InputMapper.Map(Button("key:COFFEE", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged)).Kind
+        == Win32OutputKind.None, "unknown key name maps to None");
+
     // Sink lifecycle over the injected send path: hold two keys, release one,
     // then ReleaseAll frees exactly what remains — no real SendInput in tests.
     ushort? lastReleased = null;
