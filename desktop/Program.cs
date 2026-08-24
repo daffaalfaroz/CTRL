@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using CTRL.Desktop.Input;
+using CTRL.Desktop.Input.Win32;
 using CTRL.Desktop.Protocol;
 using CTRL.Desktop.Session;
 using CTRL.Desktop.Transport;
@@ -54,11 +56,14 @@ RunHmacVectorSmokeTests();
 RunRealAuthTokenLifecycleSmokeTests();
 RunPairingLifecycleSmokeTests();
 RunLockoutSmokeTests();
+RunOutputSinkSmokeTests();
+RunWin32MapperSmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
 Console.WriteLine("M1.4.3 session integration hardening smoke tests passed.");
 Console.WriteLine("M1.4.4 real authentication smoke tests passed.");
+Console.WriteLine("M2.0 input architecture smoke tests passed.");
 return 0;
 
 static void RunFrameCodecSmokeTests()
@@ -1713,7 +1718,8 @@ static byte[] MakeFrame(byte type, byte[] payload, ushort sequence = 0,
     => FrameBuilder.Build(type, payload, sequence, ackRequested, mustUnderstand, major, 0, timestamp);
 
 static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlusher) CreateSession(
-    ulong now = 0, IAuthenticator? authenticator = null, Func<ulong>? nowProvider = null)
+    ulong now = 0, IAuthenticator? authenticator = null, Func<ulong>? nowProvider = null,
+    IOutputSink? outputSink = null)
 {
     var connection = new FakeTransportConnection();
     var listener = new RecordingSessionListener();
@@ -1728,7 +1734,8 @@ static (Session, FakeTransportConnection, RecordingSessionListener, RecordingFlu
             SessionIdFactory = () => TestData.SessionId,
             ChallengeFactory = () => TestData.Challenge,
         },
-        flusher);
+        flusher,
+        outputSink);
     return (session, connection, listener, flusher);
 }
 
@@ -2052,6 +2059,144 @@ static void RunLockoutSmokeTests()
     Assert(!limiter.IsLocked(ip, "ctrl-42a8"), "success must clear the lockout state");
 
     Console.WriteLine("M1.4.4: lockout smoke tests passed.");
+}
+
+// ---------------------------------------------------------------------------
+// M2.0 — input architecture (Session → IOutputSink boundary)
+// ---------------------------------------------------------------------------
+
+static void RunOutputSinkSmokeTests()
+{
+    static InputEvent Key(string id, byte state, byte flags) =>
+        new(id, InputEventCodec.KindButton, flags, State: state, PressCount: 1);
+
+    // Valid INPUT_EVENT reaches the sink with identical fields.
+    var sink = new TestInputSink();
+    var (s1, c1, l1, f1) = CreateSession(outputSink: sink);
+    DoHandshake(s1, c1);
+    var sent = Key("key:65", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged);
+    c1.Emit(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(new InputEventPayload(sent)), 2));
+    Assert(l1.InputEvents.Count == 1, "listener must still receive input");
+    Assert(sink.Inputs.Count == 1 && sink.Inputs[0] == sent,
+        "session must forward decoded INPUT_EVENT to IOutputSink unchanged");
+
+    // INPUT_SNAPSHOT reaches the sink too.
+    var snapshot = new InputSnapshotPayload(new List<InputEvent>
+    {
+        Key("key:65", InputEventCodec.StateDown,
+            InputEventCodec.FlagStateChanged | InputEventCodec.FlagInitial)
+    });
+    c1.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(snapshot), 3));
+    Assert(sink.Snapshots.Count == 1 && sink.Snapshots[0].Events[0].ControlId == "key:65",
+        "session must forward INPUT_SNAPSHOT to IOutputSink");
+
+    // Malformed payloads must NOT reach the sink.
+    var before = sink.Inputs.Count;
+    c1.Emit(MakeFrame(MessageType.InputEvent, new byte[] { 0x00 }, 4));
+    Assert(sink.Inputs.Count == before, "malformed input must not reach the sink");
+
+    // Graceful DISCONNECT releases everything exactly once.
+    c1.Emit(MakeFrame(MessageType.Disconnect, DisconnectPayloadCodec.Encode(new DisconnectPayload(0)), 5, mustUnderstand: true));
+    Assert(sink.ReleaseAllCount == 1, "graceful disconnect must ReleaseAll once");
+
+    // Ungraceful close also releases.
+    var sink2 = new TestInputSink();
+    var (s2, c2, l2, f2) = CreateSession(outputSink: sink2);
+    DoHandshake(s2, c2);
+    c2.EmitDisconnected("peer dropped");
+    Assert(sink2.ReleaseAllCount == 1, "ungraceful close must ReleaseAll once");
+
+    // Takeover closes the old session and releases its outputs.
+    var manager = new SessionManager();
+    var sinkOld = new TestInputSink();
+    var sinkNew = new TestInputSink();
+    var authShared = DefaultTestAuthenticator();
+    var (sA, cA, lA, fA) = CreateSession(authenticator: authShared, outputSink: sinkOld);
+    manager.Register(sA);
+    DoHandshake(sA, cA);
+    var (sB, cB, lB, fB) = CreateSession(authenticator: authShared, outputSink: sinkNew);
+    manager.Register(sB);
+    DoHandshake(sB, cB);
+    Assert(sA.State == ServerSessionState.Closed, "old session taken over");
+    Assert(sinkOld.ReleaseAllCount == 1 && sinkNew.ReleaseAllCount == 0,
+        "takeover must release only the displaced session's outputs");
+
+    // A throwing sink never breaks the session or the hot path.
+    var bad = new TestInputSink { ThrowOnHandle = true };
+    var (sT, cT, lT, fT) = CreateSession(outputSink: bad);
+    DoHandshake(sT, cT);
+    cT.Emit(MakeFrame(MessageType.InputEvent,
+        InputEventPayloadCodec.Encode(new InputEventPayload(
+            Key("key:66", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged))), 2));
+    Assert(sT.State == ServerSessionState.Ready, "sink failure must not take the session down");
+    Assert(lT.Errors.Any(e => e.Contains("HandleInput failed")),
+        "sink failure must be reported via listener");
+    bad.ThrowOnHandle = false;
+    cT.Emit(MakeFrame(MessageType.Disconnect, DisconnectPayloadCodec.Encode(new DisconnectPayload(0)), 3, mustUnderstand: true));
+    Assert(sink_ReleaseAllRan(bad), "ReleaseAll still runs after earlier HandleInput failures");
+
+    Console.WriteLine("M2.0: output-sink smoke tests passed.");
+}
+
+static bool sink_ReleaseAllRan(TestInputSink sink) => sink.ReleaseAllCount >= 1;
+
+static void RunWin32MapperSmokeTests()
+{
+    static InputEvent Button(string id, byte state, byte flags) =>
+        new(id, InputEventCodec.KindButton, flags, State: state, PressCount: 1);
+
+    // Decimal + hex virtual-key controlIds map to keyboard down/up.
+    var down = Win32InputMapper.Map(Button("key:65", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged));
+    Assert(down.Kind == Win32OutputKind.KeyDown && down.VirtualKey == 65, "key:65 down maps to VK 65 down");
+    var upHex = Win32InputMapper.Map(Button("key:0x41", InputEventCodec.StateUp, InputEventCodec.FlagStateChanged));
+    Assert(upHex.Kind == Win32OutputKind.KeyUp && upHex.VirtualKey == 0x41, "key:0x41 up maps to VK 0x41 up");
+
+    // Snapshot initial events press keys too.
+    var initial = Win32InputMapper.Map(Button("key:0x1D", InputEventCodec.StateDown, InputEventCodec.FlagInitial));
+    Assert(initial.Kind == Win32OutputKind.KeyDown && initial.VirtualKey == 0x1D,
+        "initial-flag button maps as a key press");
+
+    // Non-mapping cases are explicit None values.
+    Assert(Win32InputMapper.Map(Button("btn-fire", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged)).Kind
+        == Win32OutputKind.None, "non-key controlId maps to None in M2.0");
+    Assert(Win32InputMapper.Map(Button("key:", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged)).Kind
+        == Win32OutputKind.None, "empty key value maps to None");
+    Assert(Win32InputMapper.Map(Button("key:0xFFFF+1", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged)).Kind
+        == Win32OutputKind.None, "invalid key value maps to None");
+    Assert(Win32InputMapper.Map(Button("key:300", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged)).Kind
+        == Win32OutputKind.None, "out-of-range VK maps to None");
+    var axis = new InputEvent("stick", InputEventCodec.KindStick, InputEventCodec.FlagStateChanged, X: 0.5f, Y: -0.5f);
+    Assert(Win32InputMapper.Map(axis).Kind == Win32OutputKind.None,
+        "axis events are outside M2.0 scope and map to None");
+
+    // Sink lifecycle over the injected send path: hold two keys, release one,
+    // then ReleaseAll frees exactly what remains — no real SendInput in tests.
+    ushort? lastReleased = null;
+    var sentActions = new List<Win32Output>();
+    var sink = new Win32InputSink(actions =>
+    {
+        sentActions.AddRange(actions);
+        return actions.Count;
+    });
+    sink.HandleInput(Button("key:65", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged));
+    sink.HandleSnapshot(new InputSnapshotPayload(new List<InputEvent>
+    {
+        Button("key:66", InputEventCodec.StateDown, InputEventCodec.FlagInitial),
+        Button("key:67", InputEventCodec.StateUp, InputEventCodec.FlagInitial),
+    }));
+    Assert(new HashSet<ushort>(sink.HeldKeys).SetEquals(new[] { (ushort)65, (ushort)66 }),
+        "held-key bookkeeping must track downs and ups");
+    var beforeRelease = sentActions.Count;
+    sink.ReleaseAll();
+    Assert(sink.HeldKeys.Count == 0, "ReleaseAll must empty held keys");
+    var releasedKeys = sentActions.Skip(beforeRelease)
+        .Where(a => a.Kind == Win32OutputKind.KeyUp).Select(a => a.VirtualKey).ToHashSet();
+    Assert(releasedKeys.SetEquals(new HashSet<ushort> { 65, 66 }),
+        "ReleaseAll must release exactly the held keys");
+    sink.ReleaseAll();
+    Assert(sentActions.Count == beforeRelease + 2, "ReleaseAll must be idempotent when idle");
+
+    Console.WriteLine("M2.0: win32 mapper smoke tests passed.");
 }
 
 sealed class TestData
