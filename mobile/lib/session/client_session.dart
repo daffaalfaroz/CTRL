@@ -21,6 +21,7 @@ import '../protocol/welcome_payload.dart';
 import '../transport/transport_connection.dart';
 import 'ack_tracker.dart';
 import 'authenticator.dart';
+import 'token_store.dart';
 import 'input_snapshot_provider.dart';
 import 'sequence_tracker.dart';
 import 'session_listener.dart';
@@ -38,18 +39,24 @@ class ClientSession {
     required this.authenticator,
     required this.listener,
     required this.inputSnapshotProvider,
+    TokenStore? tokenStore,
     this.protocolMajor = 1,
     this.protocolMinor = 0,
     this.ackTimeoutMs = 3000,
     int Function()? nowMs,
-  }) : nowMs = nowMs ?? _defaultNowMs {
+  })  : tokenStore = tokenStore ?? InMemoryTokenStore(),
+        nowMs = nowMs ?? _defaultNowMs {
     _ackTracker = AckTracker(nowMs: this.nowMs, timeoutMs: ackTimeoutMs);
   }
 
   final TransportConnection transport;
-  final EchoAuthenticator authenticator;
+  final HmacAuthenticator authenticator;
   final SessionListener listener;
   final InputSnapshotProvider inputSnapshotProvider;
+
+  /// Receives newToken issued on pairing success (docs/protocol.md §12).
+  /// Production apps pass a secure store; the default keeps tokens in memory.
+  final TokenStore tokenStore;
   final int protocolMajor;
   final int protocolMinor;
   final int ackTimeoutMs;
@@ -350,6 +357,12 @@ class ClientSession {
         'AUTH_OK sessionId does not match WELCOME sessionId.',
       );
       return;
+    }
+
+    // §12: pairing success carries a newToken the client must store.
+    if (authOk.newToken.isNotEmpty) {
+      tokenStore.save(
+          authenticator.deviceId, Uint8List.fromList(authOk.newToken));
     }
 
     _becomeReady();

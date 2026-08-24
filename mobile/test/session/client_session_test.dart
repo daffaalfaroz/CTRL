@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:ctrl_mobile/protocol/ack_payload.dart';
@@ -17,6 +18,7 @@ import 'package:ctrl_mobile/protocol/input_snapshot_payload.dart';
 import 'package:ctrl_mobile/protocol/message_types.dart';
 import 'package:ctrl_mobile/protocol/pong_payload.dart';
 import 'package:ctrl_mobile/protocol/welcome_payload.dart';
+import 'package:ctrl_mobile/crypto/sha256.dart';
 import 'package:ctrl_mobile/session/ack_tracker.dart';
 import 'package:ctrl_mobile/session/authenticator.dart';
 import 'package:ctrl_mobile/session/client_session.dart';
@@ -24,6 +26,7 @@ import 'package:ctrl_mobile/session/input_snapshot_provider.dart';
 import 'package:ctrl_mobile/session/sequence_tracker.dart';
 import 'package:ctrl_mobile/session/session_listener.dart';
 import 'package:ctrl_mobile/session/session_state.dart';
+import 'package:ctrl_mobile/session/token_store.dart';
 import 'package:ctrl_mobile/transport/transport_connection.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -55,11 +58,7 @@ void main() {
       {int Function()? nowMs, int ackTimeoutMs = 3000}) {
     return ClientSession(
       transport: fake,
-      authenticator: EchoAuthenticator(
-        credentialType: authCredentialTypeToken,
-        credential: '',
-        deviceId: deviceId,
-      ),
+      authenticator: _testTokenAuthenticator(deviceId),
       listener: listener,
       inputSnapshotProvider: _FixedSnapshotProvider(),
       nowMs: nowMs,
@@ -161,7 +160,12 @@ void main() {
 
       final auth = AuthPayloadCodec.decode(fake.sentFrames[1].payload);
       expect(auth.deviceId, deviceId);
-      expect(auth.challengeResponse, challenge, reason: 'D4 echo challenge');
+      expect(auth.challengeResponse.length, 32,
+          reason: '§12: challengeResponse stays exactly 32 bytes');
+      expect(
+          auth.challengeResponse, isNot(orderedEquals(challenge)),
+          reason: 'M1.4.4: response is HMAC-SHA256(secret, challenge), '
+              'not a challenge echo');
 
       fake.emit(_frame(MessageType.authOk, AuthOkPayloadCodec.encode(authOk())));
       await session.waitForIdle();
@@ -707,11 +711,7 @@ void main() {
       final listener = RecordingListener();
       final session = ClientSession(
         transport: fake,
-        authenticator: EchoAuthenticator(
-          credentialType: authCredentialTypeToken,
-          credential: '',
-          deviceId: deviceId,
-        ),
+        authenticator: _testTokenAuthenticator(deviceId),
         listener: listener,
         inputSnapshotProvider: _InitialFlagSnapshotProvider(),
       );
@@ -846,6 +846,131 @@ void main() {
       expect(() => session.reconnect(), throwsStateError);
     });
   });
+
+  group('M1.4.4: HmacAuthenticator (docs/protocol.md §12)', () {
+    test('challengeResponse is exactly 32 bytes and matches the pinned '
+        'cross-language vector', () {
+      final auth = HmacAuthenticator.pairing(
+          pairingCode: 'ctrl-m144-cross-vector-secret', deviceId: 'd1');
+      final challenge = Uint8List.fromList(List.generate(32, (i) => i));
+      final mac = auth.challengeResponseFor(challenge);
+      expect(mac.length, 32);
+      expect(bytesToHex(mac),
+          'ce7542e18060a6367f4b393b7203b929bc5b2875d0a17f0be67e71a49210a23f');
+    });
+
+    test('token secret vector matches the C# HMACSHA256 reference', () {
+      final auth = HmacAuthenticator.token(
+        token: Uint8List.fromList(utf8.encode('ctrl-m144-token-secret')),
+        deviceId: 'd1',
+      );
+      final challenge = Uint8List.fromList(List.generate(32, (i) => i));
+      expect(bytesToHex(auth.challengeResponseFor(challenge)),
+          '6a074159523a97c4e184ee965814fe428ece623530925f54a5ea6194bdd18945');
+    });
+
+    test('different secrets yield different responses; modified challenge too',
+        () {
+      final a = HmacAuthenticator.pairing(
+          pairingCode: '111111', deviceId: 'd1');
+      final b = HmacAuthenticator.pairing(
+          pairingCode: '222222', deviceId: 'd1');
+      final challenge = Uint8List.fromList(List.filled(32, 7));
+      expect(
+        bytesToHex(a.challengeResponseFor(challenge)),
+        isNot(bytesToHex(b.challengeResponseFor(challenge))),
+      );
+      final mutated = Uint8List.fromList(challenge);
+      mutated[0] ^= 0xFF;
+      expect(
+        bytesToHex(a.challengeResponseFor(challenge)),
+        isNot(bytesToHex(a.challengeResponseFor(mutated))),
+      );
+    });
+
+    test('buildAuth keeps the wire contract: token credential stays empty', () {
+      final token =
+          Uint8List.fromList(List.generate(32, (i) => i * 3 & 0xFF));
+      final pairingAuth = HmacAuthenticator.pairing(
+              pairingCode: '123456', deviceId: 'dev-1')
+          .buildAuth(Uint8List(32));
+      expect(pairingAuth.credentialType, authCredentialTypePairingCode);
+      expect(pairingAuth.credential, '123456');
+
+      final tokenAuth =
+          HmacAuthenticator.token(token: token, deviceId: 'dev-1')
+              .buildAuth(Uint8List(32));
+      expect(tokenAuth.credentialType, authCredentialTypeToken);
+      expect(tokenAuth.credential, isEmpty,
+          reason: '§12 A: credentialLength=0 for token auth');
+    });
+  });
+
+  group('M1.4.4: newToken handling (§12)', () {
+    test('AUTH_OK with newToken stores it in the TokenStore', () async {
+      final fake = FakeTransport();
+      final store = InMemoryTokenStore();
+      final session = ClientSession(
+        transport: fake,
+        authenticator:
+            _testTokenAuthenticator(deviceId, secret: utf8.encode('pw')),
+        listener: RecordingListener(),
+        inputSnapshotProvider: _FixedSnapshotProvider(),
+        tokenStore: store,
+      );
+
+      session.connect();
+      await session.waitForIdle();
+      final issuedToken = Uint8List.fromList(
+          List.generate(32, (i) => (i * 7) & 0xFF));
+      final welcomeWithPairingOk = _frame(
+          MessageType.welcome, WelcomePayloadCodec.encode(_welcome()));
+      fake.emit(welcomeWithPairingOk);
+      await session.waitForIdle();
+      final authOk = AuthOkPayload(
+        result: authOkResultOk,
+        sessionId: _welcome().sessionId,
+        serverCapabilities: 0x7,
+        newToken: issuedToken,
+      );
+      fake.emit(_frame(MessageType.authOk, AuthOkPayloadCodec.encode(authOk)));
+      await session.waitForIdle();
+
+      expect(session.state, ClientSessionState.ready);
+      final saved = store.load(deviceId);
+      expect(saved, isNotNull);
+      expect(saved, orderedEquals(issuedToken));
+    });
+
+    test('AUTH_OK without newToken leaves the stored token untouched',
+        () async {
+      final fake = FakeTransport();
+      final store = InMemoryTokenStore();
+      final existing = Uint8List.fromList(utf8.encode('existing-token'));
+      store.save(deviceId, existing);
+      final session = ClientSession(
+        transport: fake,
+        authenticator: _testTokenAuthenticator(deviceId),
+        listener: RecordingListener(),
+        inputSnapshotProvider: _FixedSnapshotProvider(),
+        tokenStore: store,
+      );
+      await _toReady(session, fake);
+
+      final saved = store.load(deviceId)!;
+      expect(saved, orderedEquals(existing));
+    });
+  });
+}
+
+/// Token-flow authenticator with a fixed deterministic secret for scripted
+/// server tests (the fake server never validates the HMAC itself).
+HmacAuthenticator _testTokenAuthenticator(String deviceId,
+    {List<int> secret = const [0x74, 0x65, 0x73, 0x74]}) {
+  return HmacAuthenticator.token(
+    token: Uint8List.fromList(secret),
+    deviceId: deviceId,
+  );
 }
 
 Future<void> _toReady(ClientSession session, FakeTransport fake) async {

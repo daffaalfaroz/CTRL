@@ -284,7 +284,7 @@ public sealed class Session
             return;
         }
 
-        var result = _authenticator.Authenticate(auth, _challenge);
+        var result = _authenticator.Authenticate(auth, _challenge, _connection.RemoteAddress);
         if (!result.Accepted)
         {
             Send(MessageType.AuthDenied,
