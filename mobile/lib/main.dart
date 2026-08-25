@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 
 import 'app/app_connection_phase.dart';
 import 'app/connection_controller.dart';
+import 'app/connection_settings.dart';
 import 'input/keyboard_panel.dart';
+import 'input/touchpad_surface.dart';
 import 'session/secure_token_store.dart';
 import 'session/token_store.dart';
 
@@ -11,17 +13,19 @@ void main() {
 }
 
 class CtrlApp extends StatelessWidget {
-  const CtrlApp({super.key, this.tokenStore});
+  const CtrlApp({super.key, this.tokenStore, this.settingsStore});
 
   /// Injectable for widget tests; production uses SecureTokenStore.
   final TokenStore? tokenStore;
+  final ConnectionSettingsStore? settingsStore;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'CTRL',
       theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-      home: ConnectionPage(tokenStore: tokenStore),
+      home: ConnectionPage(
+          tokenStore: tokenStore, settingsStore: settingsStore),
     );
   }
 }
@@ -30,10 +34,12 @@ class CtrlApp extends StatelessWidget {
 /// and a minimal control surface. Widgets only talk to
 /// [ConnectionController] — protocol/session/security types stay out of the UI.
 class ConnectionPage extends StatefulWidget {
-  const ConnectionPage({super.key, this.tokenStore, this.controller});
+  const ConnectionPage(
+      {super.key, this.tokenStore, this.controller, this.settingsStore});
 
   final TokenStore? tokenStore;
   final ConnectionController? controller;
+  final ConnectionSettingsStore? settingsStore;
 
   @override
   State<ConnectionPage> createState() => _ConnectionPageState();
@@ -41,6 +47,8 @@ class ConnectionPage extends StatefulWidget {
 
 class _ConnectionPageState extends State<ConnectionPage> {
   late ConnectionController _controller;
+  late final ConnectionSettingsStore _settingsStore =
+      widget.settingsStore ?? ConnectionSettingsStore();
   late final TextEditingController _hostField;
   late final TextEditingController _portField;
   late final TextEditingController _deviceIdField;
@@ -64,13 +72,29 @@ class _ConnectionPageState extends State<ConnectionPage> {
   void initState() {
     super.initState();
     _controller = widget.controller ??
-        ConnectionController(tokenStore: widget.tokenStore ?? SecureTokenStore());
+        ConnectionController(
+            tokenStore: widget.tokenStore ?? SecureTokenStore(),
+            settingsStore: _settingsStore);
     _controller.addListener(_onControllerChanged);
     _hostField = TextEditingController(text: '127.0.0.1');
     _portField = TextEditingController(text: '42123');
     _deviceIdField = TextEditingController(text: 'ctrl-android');
     _pairingCodeField = TextEditingController();
     _refreshStoredTokenFlag();
+    _loadPersistedSettings();
+  }
+
+  /// Phase 2: restore persisted host/port/deviceId into the form (safe
+  /// fallbacks apply for missing/corrupt values).
+  Future<void> _loadPersistedSettings() async {
+    final settings = await _settingsStore.load();
+    if (!mounted) return;
+    setState(() {
+      _hostField.text = settings.host;
+      _portField.text = '${settings.port}';
+      _deviceIdField.text = settings.deviceId;
+    });
+    await _refreshStoredTokenFlag();
   }
 
   @override
@@ -82,7 +106,8 @@ class _ConnectionPageState extends State<ConnectionPage> {
       old.dispose();
       _controller = widget.controller ??
           ConnectionController(
-              tokenStore: widget.tokenStore ?? SecureTokenStore());
+              tokenStore: widget.tokenStore ?? SecureTokenStore(),
+              settingsStore: _settingsStore);
       _controller.addListener(_onControllerChanged);
       _refreshStoredTokenFlag();
     }
@@ -188,11 +213,18 @@ class _ConnectionPageState extends State<ConnectionPage> {
               Text('Keyboard controls',
                   style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 8),
-              KeyboardPanel(
-                keys: _quickKeys,
-                onKeyEvent: (controlId, down) =>
-                    _controller.sendKeyEvent(controlId, down),
-              ),
+                KeyboardPanel(
+                  keys: _quickKeys,
+                  onKeyEvent: (controlId, down) =>
+                      _controller.sendKeyEvent(controlId, down),
+                ),
+                const SizedBox(height: 16),
+                Text('Touchpad',
+                    style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                TouchpadSurface(
+                  onAction: _controller.handleTouchpadAction,
+                ),
             ],
           ],
         ),
