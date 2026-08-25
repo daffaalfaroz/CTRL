@@ -61,6 +61,7 @@ RunWin32MapperSmokeTests();
 RunMouseSinkSmokeTests();
 await RunInputReliabilitySmokeTests();
 RunGamepadInputSmokeTests();
+RunGamepadOutputBackendSmokeTests();
 
 Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
 Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
@@ -2735,6 +2736,110 @@ static void RunGamepadInputSmokeTests()
 
     Console.WriteLine("M2.4: gamepad input smoke tests passed.");
 }
+
+// ---------------------------------------------------------------------------
+// M2.5 Phase A — gamepad output backend (IGamepadOutputBackend)
+// ---------------------------------------------------------------------------
+
+static void RunGamepadOutputBackendSmokeTests()
+{
+    static InputEvent GpButton(string id, byte state, byte flags = InputEventCodec.FlagStateChanged) =>
+        new(id, InputEventCodec.KindButton, flags, State: state, PressCount: 1);
+
+    // --- Null backend default: zero behavior change vs M2.4 ------------------
+    var nullSink = new Win32InputSink(motionLoopEnabled: false);
+    nullSink.HandleInput(GpButton("gamepad:a", InputEventCodec.StateDown));
+    Assert(nullSink.HeldGamepadButtons.Contains(Win32GamepadButton.A) &&
+           nullSink.BackendFailures == 0,
+        "default Null backend tracks state without failures");
+    nullSink.ReleaseAll();
+    Assert(nullSink.HeldGamepadButtons.Count == 0 && nullSink.BackendFailures == 0,
+        "Null backend ReleaseAll stays silent and safe");
+
+    // --- Test backend records the full lifecycle through the real sink -------
+    var backend = new TestGamepadBackend();
+    var sink = new Win32InputSink(motionLoopEnabled: false, gamepadBackend: backend);
+    Assert(backend.Connected && backend.Log[0] == "Connect:1",
+        "sink must Connect its backend on construction");
+    Assert(backend.Log.Contains("Dispose") == false, "no premature dispose");
+
+    sink.HandleInput(GpButton("gamepad:a", InputEventCodec.StateDown));
+    Assert(backend.HeldButtons.Contains(Win32GamepadButton.A) &&
+           backend.Log.Contains("SetButton:A:down"),
+        "button press forwarded to backend");
+
+    sink.HandleInput(new InputEvent(
+        "gamepad:lstick", InputEventCodec.KindStick, 0, X: -0.5f, Y: 0.25f));
+    Assert(backend.Sticks[1].X == -0.5f && backend.Sticks[1].Y == 0.25f,
+        "left stick position forwarded to backend");
+
+    sink.HandleInput(new InputEvent(
+        "gamepad:rt", InputEventCodec.KindTrigger, 0, Value: 0.6f));
+    Assert(Math.Abs(backend.Triggers[2] - 0.6f) < 0.0001f,
+        "right trigger value forwarded to backend");
+
+    sink.HandleInput(new InputEvent(
+        "gamepad:dpad", InputEventCodec.KindHat, 0, HatValue: 3));
+    Assert(backend.LastHat == 3, "hat value forwarded to backend");
+
+    sink.HandleInput(GpButton("gamepad:a", InputEventCodec.StateUp));
+    Assert(!backend.HeldButtons.Contains(Win32GamepadButton.A) &&
+           backend.Log.Contains("SetButton:A:up"),
+        "button release forwarded to backend");
+
+    // Granular releases must NOT touch gamepad backend.
+    var logLen = backend.Log.Count;
+    sink.HandleInput(KeyButtonReliability("key:A", InputEventCodec.StateDown));
+    sink.ReleaseKeys();
+    Assert(backend.Log.Count == logLen,
+        "ReleaseKeys is isolated from the gamepad backend");
+
+    // ReleaseGamepad reaches the backend exactly once.
+    sink.ReleaseGamepad();
+    Assert(backend.ReleaseAllCount == 1, "ReleaseGamepad forwards one backend neutralize");
+    Assert(backend.Log[^1] == "ReleaseAll", "last backend op is the neutralize");
+
+    // Session-level disconnect cleanup also reaches the backend.
+    var sessionBackend = new TestGamepadBackend();
+    var (s1, c1, l1, f1) = CreateSession(outputSink:
+        new Win32InputSink(motionLoopEnabled: false, gamepadBackend: sessionBackend));
+    DoHandshake(s1, c1);
+    c1.Emit(MakeFrame(MessageType.InputEvent, InputEventPayloadCodec.Encode(
+        new InputEventPayload(GpButton("gamepad:b", InputEventCodec.StateDown))), 2));
+    c1.Emit(MakeFrame(MessageType.Disconnect, DisconnectPayloadCodec.Encode(new DisconnectPayload(0)), 3, mustUnderstand: true));
+    Assert(sessionBackend.HeldButtons.Contains(Win32GamepadButton.B) == false ||
+           sessionBackend.ReleaseAllCount == 1,
+        "session disconnect neutralizes the gamepad backend");
+
+    // --- Failure injection: sink survives, logical state consistent ----------
+    var failing = new TestGamepadBackend
+    {
+        FailureInjection = op => op.StartsWith("SetButton")
+            ? new InvalidOperationException("backend unavailable")
+            : null!,
+    };
+    var failSink = new Win32InputSink(motionLoopEnabled: false, gamepadBackend: failing);
+    failSink.HandleInput(GpButton("gamepad:a", InputEventCodec.StateDown));
+    Assert(failSink.BackendFailures >= 1, "backend failure must be counted");
+    Assert(failSink.HeldGamepadButtons.Contains(Win32GamepadButton.A),
+        "logical state still tracked despite backend failure");
+    failing.FailureInjection = null;
+    failSink.ReleaseAll();
+    Assert(failSink.HeldGamepadButtons.Count == 0 && failing.ReleaseAllCount == 1,
+        "cleanup converges once failures stop; no retry storm");
+
+    // Dispose path forwards to backend exactly once.
+    var disposedBackend = new TestGamepadBackend();
+    var disposableSink = new Win32InputSink(motionLoopEnabled: false, gamepadBackend: disposedBackend);
+    disposableSink.Dispose();
+    disposableSink.Dispose(); // idempotent
+    Assert(disposedBackend.Disposals == 1, "Dispose forwards to backend exactly once");
+
+    Console.WriteLine("M2.5 Phase A: gamepad output backend smoke tests passed.");
+}
+
+static InputEvent KeyButtonReliability(string id, byte state) =>
+    new(id, InputEventCodec.KindButton, InputEventCodec.FlagStateChanged, State: state, PressCount: 1);
 
 static float lsticks_Fx((float Fx, float Fy) axis) => axis.Fx;
 static float lsticks_Fy((float Fx, float Fy) axis) => axis.Fy;

@@ -33,6 +33,7 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
     private readonly HashSet<Win32GamepadButton> _heldGamepadButtons = new();
     private readonly Dictionary<string, (float Fx, float Fy)> _gamepadAxes = new();
     private readonly Func<IReadOnlyList<Win32Output>, int> _send;
+    private readonly IGamepadOutputBackend _gamepadBackend;
     private readonly bool _motionLoopEnabled;
     private readonly ITimer? _motionTimer;
     private float _moveVx;
@@ -43,9 +44,18 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
     private double _wheelDownAccum;
     private bool _disposed;
 
-    public Win32InputSink(Func<IReadOnlyList<Win32Output>, int>? send = null, bool motionLoopEnabled = true)
+    /// <summary>
+    /// Number of gamepad backend operations that threw. Diagnostics only — the
+    /// failure never propagates to the session and logical state stays
+    /// consistent (M2.3 pattern).
+    /// </summary>
+    public int BackendFailures { get; private set; }
+
+    public Win32InputSink(Func<IReadOnlyList<Win32Output>, int>? send = null, bool motionLoopEnabled = true,
+        IGamepadOutputBackend? gamepadBackend = null)
     {
         _send = send ?? NativeSend;
+        _gamepadBackend = gamepadBackend ?? NullGamepadBackend.Instance;
         _motionLoopEnabled = motionLoopEnabled;
         if (motionLoopEnabled)
         {
@@ -53,6 +63,7 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
                 _ => { try { PumpTick(); } catch { /* loop must never throw */ } },
                 null, MotionTickMs, MotionTickMs);
         }
+        RunBackendSafe(_gamepadBackend.Connect);
     }
 
     /// <summary>Virtual keys currently held down (test/diagnostic view).</summary>
@@ -255,10 +266,9 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
     {
         ReleaseKeys();
         ReleaseMouseButtons();
+        ReleaseGamepad();
         lock (_gate)
         {
-            _heldGamepadButtons.Clear();
-            _gamepadAxes.Clear();
             // Motion state resets to neutral too (§16).
             _moveVx = _moveVy = 0;
             _wheelUpSpeed = _wheelDownSpeed = 0;
@@ -267,13 +277,30 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
     }
 
     /// <summary>Releases only gamepad state (buttons + analog axes). Isolated
-    /// from keyboard/mouse; idempotent. M2.4.</summary>
+    /// from keyboard/mouse; idempotent. The backend receives the neutralize
+    /// operation even when nothing is held, so physical state converges.
+    /// M2.5 Phase A.</summary>
     public void ReleaseGamepad()
     {
         lock (_gate)
         {
             _heldGamepadButtons.Clear();
             _gamepadAxes.Clear();
+        }
+        RunBackendSafe(_gamepadBackend.ReleaseAll);
+    }
+
+    /// <summary>Runs a backend operation, converting failures into the sink's
+    /// diagnostic counter — never a crash and never a retry storm (M2.3).</summary>
+    private void RunBackendSafe(Action operation)
+    {
+        try
+        {
+            operation();
+        }
+        catch (Exception)
+        {
+            BackendFailures++;
         }
     }
 
@@ -317,6 +344,7 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
             return;
         _disposed = true;
         _motionTimer?.Dispose();
+        RunBackendSafe(_gamepadBackend.Dispose);
     }
 
     private static Win32Output Wheel(ushort direction) =>
@@ -366,20 +394,26 @@ public sealed class Win32InputSink : IOutputSink, IDisposable
                         // for gamepads (see analisis-teknis.md §16) — tracked so
                         // bindings/snapshot/ReleaseAll stay authoritative.
                         _heldGamepadButtons.Add(mapped.GamepadButton);
+                        RunBackendSafe(() => _gamepadBackend.SetButton(mapped.GamepadButton, down: true));
                         break;
                     case Win32OutputKind.GamepadButtonUp:
                         _heldGamepadButtons.Remove(mapped.GamepadButton);
+                        RunBackendSafe(() => _gamepadBackend.SetButton(mapped.GamepadButton, down: false));
                         break;
                     case Win32OutputKind.GamepadStickState:
-                        _gamepadAxes[mapped.VirtualKey == 1 ? "gamepad:lstick" : "gamepad:rstick"] =
-                            (mapped.Fx, mapped.Fy);
+                        var stickKey = mapped.VirtualKey == 1 ? "gamepad:lstick" : "gamepad:rstick";
+                        _gamepadAxes[stickKey] = (mapped.Fx, mapped.Fy);
+                        RunBackendSafe(() => _gamepadBackend.SetStick(
+                            mapped.VirtualKey, mapped.Fx, mapped.Fy));
                         break;
                     case Win32OutputKind.GamepadTriggerState:
-                        _gamepadAxes[mapped.VirtualKey == 1 ? "gamepad:lt" : "gamepad:rt"] =
-                            (mapped.Fx, 0);
+                        var trigKey = mapped.VirtualKey == 1 ? "gamepad:lt" : "gamepad:rt";
+                        _gamepadAxes[trigKey] = (mapped.Fx, 0);
+                        RunBackendSafe(() => _gamepadBackend.SetTrigger(mapped.VirtualKey, mapped.Fx));
                         break;
                     case Win32OutputKind.GamepadHatState:
                         _gamepadAxes["gamepad:dpad"] = (mapped.VirtualKey, 0);
+                        RunBackendSafe(() => _gamepadBackend.SetHat((byte)mapped.VirtualKey));
                         break;
                 }
             }
