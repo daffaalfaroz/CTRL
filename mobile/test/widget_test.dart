@@ -1,30 +1,23 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
+import 'package:ctrl_mobile/app/connection_controller.dart';
+import 'package:ctrl_mobile/main.dart';
+import 'package:ctrl_mobile/session/token_store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:ctrl_mobile/main.dart';
-
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
-
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+  // M3.0 replaced the Flutter template counter with the CTRL connection
+  // shell; this smoke test pins the new real entry point.
+  testWidgets('CTRL app shell starts in the disconnected state', (tester) async {
+    await tester.pumpWidget(MaterialApp(
+      home: ConnectionPage(
+        tokenStore: InMemoryTokenStore(),
+        controller: ConnectionController(tokenStore: InMemoryTokenStore()),
+      ),
+    ));
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('Disconnected'), findsOneWidget);
+    expect(find.text('Pair & connect'), findsOneWidget);
+    expect(find.text('Desktop address'), findsOneWidget);
   });
 }
