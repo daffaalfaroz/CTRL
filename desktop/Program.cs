@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -7,68 +7,138 @@ using CTRL.Desktop.Input.Win32;
 using CTRL.Desktop.Protocol;
 using CTRL.Desktop.Session;
 using CTRL.Desktop.Transport;
-
-if (args.Length >= 1 && args[0] == "--integration")
+using CTRL.Desktop;
+using System.Windows;
+static class Program
 {
-    var port = args.Length >= 2 && int.TryParse(args[1], out var p) ? p : 0;
-    return await RunIntegrationServerAsync(port);
+    static void Main(string[] args)
+    {
+        if (args.Length >= 1 && args[0] == "--integration")
+        {
+            var port = args.Length >= 2 && int.TryParse(args[1], out var p) ? p : 0;
+            RunIntegrationServerAsync(port).Wait();
+            return;
+        }
+
+        var app = new App();
+        app.Run();
+    }
+
+public static async Task<int> RunIntegrationServerAsync(int port)
+{
+    var server = new TcpServer(port);
+    var manager = new SessionManager();
+    var listener = new IntegrationListener();
+    var flusher = new IntegrationFlusher();
+    // M1.4.4: real ┬º12 authentication. The pairing code is pinned so the Dart
+    // integration client can pair deterministically; later phases reconnect
+    // with the issued (deterministic) token.
+    var pairing = new PairingCodeService(codeFactory: () => AuthTestEnv.PairingCode);
+    pairing.IssueExplicit(AuthTestEnv.PairingCode);
+    var authenticator = new HmacAuthenticator(
+        AuthTestEnv.MasterKey, new InMemoryTokenStore(), pairing);
+    var options = new SessionOptions
+    {
+        SessionIdFactory = () => TestData.SessionId,
+        ChallengeFactory = () => TestData.Challenge,
+    };
+
+    server.ClientConnected += connection =>
+    {
+        var recording = new RecordingTransportConnection(connection);
+        var session = new Session(
+            recording,
+            authenticator,
+            listener,
+            options,
+            flusher,
+            new IntegrationOutputSink());
+        session.Authenticated += s =>
+        {
+            Console.WriteLine($"C#:AUTHENTICATED:{s.DeviceId}");
+            Console.Out.Flush();
+        };
+        session.Closed += s =>
+        {
+            Console.WriteLine($"C#:CLOSED:{s.DeviceId}");
+            Console.Out.Flush();
+        };
+        manager.Register(session);
+        return Task.CompletedTask;
+    };
+
+    _ = server.StartAsync();
+    await DesktopSmokeTests.WaitUntil(() => server.LocalPort >= 0);
+    Console.WriteLine($"C#:LISTENING:{server.LocalPort}");
+    Console.Out.Flush();
+
+    // Drive the server from stdin: any line other than STOP is ignored; EOF or
+    // STOP stops the listener and exits (the Dart integration tool sends STOP).
+    while (true)
+    {
+        var line = Console.ReadLine();
+        if (line == null || line.Trim() == "STOP")
+            break;
+    }
+
+    await server.StopAsync();
+    return 0;
+}
 }
 
-RunFrameCodecSmokeTests();
-RunPayloadPrimitiveSmokeTests();
-RunHelloCodecSmokeTests();
-RunWelcomeCodecSmokeTests();
-RunAuthCodecSmokeTests();
-RunAuthOkCodecSmokeTests();
-RunAuthDeniedCodecSmokeTests();
-RunErrorCodecSmokeTests();
-RunDisconnectCodecSmokeTests();
-RunHeartbeatCodecSmokeTests();
-RunPongCodecSmokeTests();
-RunAckCodecSmokeTests();
-RunInputEventCodecSmokeTests();
-RunInputSnapshotCodecSmokeTests();
-RunInputResetCodecSmokeTests();
-RunFrameBufferSmokeTests();
-await RunLoopbackTransportSmokeTests();
-RunSequenceTrackerSmokeTests();
-RunAckTrackerSmokeTests();
-RunSessionHandshakeSmokeTests();
-RunSessionForbiddenFlagSmokeTests();
-RunSessionNotAuthenticatedSmokeTests();
-RunSessionInvalidMessageSmokeTests();
-RunSessionUnsupportedMessageSmokeTests();
-RunSessionWrongDirectionSmokeTests();
-RunSessionInputDropSmokeTests();
-RunSessionPongSmokeTests();
-RunSessionAckSmokeTests();
-RunSessionAuthDeniedSmokeTests();
-RunSessionTakeoverSmokeTests();
-await RunSessionLoopbackHostSmokeTests();
-RunSequenceWrapSmokeTests();
-RunSessionStateTransitionSmokeTests();
-RunSessionAckLifecycleSmokeTests();
-RunSessionHeartbeatTimeoutSmokeTests();
-RunSessionDisconnectFlushSmokeTests();
-RunSessionSnapshotBoundarySmokeTests();
-RunSessionSequenceBoundarySmokeTests();
-RunHmacVectorSmokeTests();
-RunRealAuthTokenLifecycleSmokeTests();
-RunPairingLifecycleSmokeTests();
-RunLockoutSmokeTests();
-RunOutputSinkSmokeTests();
-RunWin32MapperSmokeTests();
-RunMouseSinkSmokeTests();
-await RunInputReliabilitySmokeTests();
-RunGamepadInputSmokeTests();
-RunGamepadOutputBackendSmokeTests();
-
-Console.WriteLine("M1.1 + M1.2.1 + M1.2.2 + M1.2.3 + M1.3 protocol smoke tests passed.");
-Console.WriteLine("M1.4.2 session/connection state machine smoke tests passed.");
-Console.WriteLine("M1.4.3 session integration hardening smoke tests passed.");
-Console.WriteLine("M1.4.4 real authentication smoke tests passed.");
-Console.WriteLine("M2.0 input architecture smoke tests passed.");
-return 0;
+static class DesktopSmokeTests
+{
+    public static void RunAll()
+    {
+        RunFrameCodecSmokeTests();
+        RunPayloadPrimitiveSmokeTests();
+        RunHelloCodecSmokeTests();
+        RunWelcomeCodecSmokeTests();
+        RunAuthCodecSmokeTests();
+        RunAuthOkCodecSmokeTests();
+        RunAuthDeniedCodecSmokeTests();
+        RunErrorCodecSmokeTests();
+        RunDisconnectCodecSmokeTests();
+        RunHeartbeatCodecSmokeTests();
+        RunPongCodecSmokeTests();
+        RunAckCodecSmokeTests();
+        RunInputEventCodecSmokeTests();
+        RunInputSnapshotCodecSmokeTests();
+        RunInputResetCodecSmokeTests();
+        RunFrameBufferSmokeTests();
+        RunLoopbackTransportSmokeTests().Wait();
+        RunSequenceTrackerSmokeTests();
+        RunAckTrackerSmokeTests();
+        RunSessionHandshakeSmokeTests();
+        RunSessionForbiddenFlagSmokeTests();
+        RunSessionNotAuthenticatedSmokeTests();
+        RunSessionInvalidMessageSmokeTests();
+        RunSessionUnsupportedMessageSmokeTests();
+        RunSessionWrongDirectionSmokeTests();
+        RunSessionInputDropSmokeTests();
+        RunSessionPongSmokeTests();
+        RunSessionAckSmokeTests();
+        RunSessionAuthDeniedSmokeTests();
+        RunSessionTakeoverSmokeTests();
+        RunSessionLoopbackHostSmokeTests().Wait();
+        RunSequenceWrapSmokeTests();
+        RunSessionStateTransitionSmokeTests();
+        RunSessionAckLifecycleSmokeTests();
+        RunSessionHeartbeatTimeoutSmokeTests();
+        RunSessionDisconnectFlushSmokeTests();
+        RunSessionSnapshotBoundarySmokeTests();
+        RunSessionSequenceBoundarySmokeTests();
+        RunHmacVectorSmokeTests();
+        RunRealAuthTokenLifecycleSmokeTests();
+        RunPairingLifecycleSmokeTests();
+        RunLockoutSmokeTests();
+        RunOutputSinkSmokeTests();
+        RunWin32MapperSmokeTests();
+        RunMouseSinkSmokeTests();
+        RunInputReliabilitySmokeTests().Wait();
+        RunGamepadInputSmokeTests();
+        RunGamepadOutputBackendSmokeTests();
+    }
 
 static void RunFrameCodecSmokeTests()
 {
@@ -119,7 +189,7 @@ static void RunPayloadPrimitiveSmokeTests()
     writer.WriteUInt64(0x0102030405060708UL);
     writer.WriteFloat32(0.5f);
     writer.WriteString("hi");
-    writer.WriteString("€");
+    writer.WriteString("Γé¼");
 
     var reader = new PayloadReader(writer.ToArray());
     if (reader.ReadUInt8() != 0xAB) throw new Exception("uint8 round-trip failed.");
@@ -128,11 +198,11 @@ static void RunPayloadPrimitiveSmokeTests()
     if (reader.ReadUInt64() != 0x0102030405060708UL) throw new Exception("uint64 round-trip failed.");
     if (reader.ReadFloat32() != 0.5f) throw new Exception("float32 round-trip failed.");
     if (reader.ReadString() != "hi") throw new Exception("string round-trip failed.");
-    if (reader.ReadString() != "€") throw new Exception("multi-byte string round-trip failed.");
+    if (reader.ReadString() != "Γé¼") throw new Exception("multi-byte string round-trip failed.");
     reader.ExpectEnd();
 
     var stringBytes = new PayloadWriter();
-    stringBytes.WriteString("€");
+    stringBytes.WriteString("Γé¼");
     var stringPayload = stringBytes.ToArray();
     if (stringPayload[0] != 3)
         throw new Exception("String prefix must be the UTF-8 byte length, not char count.");
@@ -177,7 +247,7 @@ static void RunHelloCodecSmokeTests()
     if (sixtyFourDecoded != sixtyFour)
         throw new Exception("HELLO 64-byte deviceId/clientVersion round-trip failed.");
 
-    var multiByte = new HelloPayload("é", "c", 1, 0, 0x00000007);
+    var multiByte = new HelloPayload("├⌐", "c", 1, 0, 0x00000007);
     var multiByteBytes = HelloPayloadCodec.Encode(multiByte);
     if (multiByteBytes[0] != 2)
         throw new Exception("HELLO deviceId length must be UTF-8 byte count.");
@@ -249,7 +319,7 @@ static void RunWelcomeCodecSmokeTests()
     if (sixtyFourNameDecoded.ServerName.Length != 64)
         throw new Exception("WELCOME 64-byte serverName round-trip failed.");
 
-    var multiByteName = new WelcomePayload("é", 1, 0, 1, new byte[16], true, new byte[32]);
+    var multiByteName = new WelcomePayload("├⌐", 1, 0, 1, new byte[16], true, new byte[32]);
     var multiByteNameBytes = WelcomePayloadCodec.Encode(multiByteName);
     if (multiByteNameBytes[0] != 2)
         throw new Exception("WELCOME serverName length must be UTF-8 byte count.");
@@ -323,7 +393,7 @@ static void RunAuthCodecSmokeTests()
     if (sixtyFourIdDecoded.DeviceId.Length != 64)
         throw new Exception("AUTH 64-byte deviceId round-trip failed.");
 
-    var multiByteId = new AuthPayload(0x02, "", "dé", new byte[32]);
+    var multiByteId = new AuthPayload(0x02, "", "d├⌐", new byte[32]);
     var multiByteIdBytes = AuthPayloadCodec.Encode(multiByteId);
     if (multiByteIdBytes[1] != 0x00 || multiByteIdBytes[2] != 3)
         throw new Exception("AUTH deviceId length must be UTF-8 byte count.");
@@ -449,7 +519,7 @@ static void RunAuthDeniedCodecSmokeTests()
     if (emptyDecoded.Message.Length != 0 || emptyDecoded.Reason != 0x02)
         throw new Exception("AUTH_DENIED empty message round-trip failed.");
 
-    var utf8Msg = AuthDeniedPayloadCodec.Encode(new AuthDeniedPayload(0x01, "échec"));
+    var utf8Msg = AuthDeniedPayloadCodec.Encode(new AuthDeniedPayload(0x01, "├⌐chec"));
     if (utf8Msg[1] != 6)
         throw new Exception("AUTH_DENIED message length must be the UTF-8 byte length.");
 
@@ -505,7 +575,7 @@ static void RunErrorCodecSmokeTests()
     if (emptyDecoded.Message.Length != 0)
         throw new Exception("ERROR empty message round-trip failed.");
 
-    var utf8Msg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, "échec"));
+    var utf8Msg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, "├⌐chec"));
     if (utf8Msg[2] != 0x00 || utf8Msg[3] != 6)
         throw new Exception("ERROR messageLength must be uint16 BE UTF-8 byte length.");
 
@@ -718,7 +788,7 @@ static void RunInputEventCodecSmokeTests()
     }
 
     var utf8Id = new InputEvent(
-        "é", InputEventCodec.KindButton, 0, State: InputEventCodec.StateUp, PressCount: 0);
+        "├⌐", InputEventCodec.KindButton, 0, State: InputEventCodec.StateUp, PressCount: 0);
     var utf8Encoded = InputEventPayloadCodec.Encode(new InputEventPayload(utf8Id));
     if (utf8Encoded[0] != 2)
         throw new Exception("controlId length must be the UTF-8 byte length.");
@@ -1102,7 +1172,7 @@ static void RunSessionForbiddenFlagSmokeTests()
     var raw = MakeFrame(MessageType.Hello,
         HelloPayloadCodec.Encode(new HelloPayload("ctrl-42a8", "0.1.0", 1, 0, 0x00000007)),
         0, mustUnderstand: true);
-    raw[4] = 0x02; // reserved flag SECURE — Encode refuses it, so patch raw bytes directly.
+    raw[4] = 0x02; // reserved flag SECURE ΓÇö Encode refuses it, so patch raw bytes directly.
     conn.Emit(raw);
 
     Assert(conn.SentFrames.Count == 1 && conn.SentFrames[0].MessageType == MessageType.Error,
@@ -1507,7 +1577,7 @@ static void RunSessionHeartbeatTimeoutSmokeTests()
     c1.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(42)), 2));
     Assert(c1.SentFrames[^1].MessageType == MessageType.Pong, "server must reply PONG to HEARTBEAT");
     Assert((c1.SentFrames[^1].Flags & FrameCodec.AckRequested) == 0,
-        "PONG must not use ACK_REQUESTED (docs/protocol.md §10)");
+        "PONG must not use ACK_REQUESTED (docs/protocol.md ┬º10)");
     Assert(s1.PendingAckCount == 0, "PONG must not enter the ACK tracker");
 
     clock.Value = 2999 + 2999;
@@ -1580,7 +1650,7 @@ static void RunSessionSnapshotBoundarySmokeTests()
     c1.Emit(MakeFrame(MessageType.InputSnapshot, InputSnapshotPayloadCodec.Encode(snapshot), 2));
     Assert(l1.Snapshots.Count == 1, "snapshot after AUTH_OK must be delivered");
     Assert((l1.Snapshots[0].Events[0].Flags & InputEventCodec.FlagInitial) != 0,
-        "snapshot entry must preserve the initial flag (docs/protocol.md §15)");
+        "snapshot entry must preserve the initial flag (docs/protocol.md ┬º15)");
 
     // Reconnect scenario: new session on the same device takes over; the old
     // one is closed + flushed and the new one carries its own snapshot.
@@ -1614,7 +1684,7 @@ static void RunSessionSequenceBoundarySmokeTests()
         });
 
     // Outbound: the first server message after AUTH_OK must carry sequence 0
-    // (docs/protocol.md §7/§24.5), then increment per message.
+    // (docs/protocol.md ┬º7/┬º24.5), then increment per message.
     var (s1, c1, l1, f1) = CreateSession();
     DoHandshake(s1, c1);
     c1.Emit(MakeFrame(MessageType.Heartbeat, HeartbeatPayloadCodec.Encode(new HeartbeatPayload(42)), 0));
@@ -1656,68 +1726,6 @@ static void RunSessionSequenceBoundarySmokeTests()
 
     Console.WriteLine("M1.4.3: session sequence-boundary smoke tests passed.");
 }
-
-static async Task<int> RunIntegrationServerAsync(int port)
-{
-    var server = new TcpServer(port);
-    var manager = new SessionManager();
-    var listener = new IntegrationListener();
-    var flusher = new IntegrationFlusher();
-    // M1.4.4: real §12 authentication. The pairing code is pinned so the Dart
-    // integration client can pair deterministically; later phases reconnect
-    // with the issued (deterministic) token.
-    var pairing = new PairingCodeService(codeFactory: () => AuthTestEnv.PairingCode);
-    pairing.IssueExplicit(AuthTestEnv.PairingCode);
-    var authenticator = new HmacAuthenticator(
-        AuthTestEnv.MasterKey, new InMemoryTokenStore(), pairing);
-    var options = new SessionOptions
-    {
-        SessionIdFactory = () => TestData.SessionId,
-        ChallengeFactory = () => TestData.Challenge,
-    };
-
-    server.ClientConnected += connection =>
-    {
-        var recording = new RecordingTransportConnection(connection);
-        var session = new Session(
-            recording,
-            authenticator,
-            listener,
-            options,
-            flusher,
-            new IntegrationOutputSink());
-        session.Authenticated += s =>
-        {
-            Console.WriteLine($"C#:AUTHENTICATED:{s.DeviceId}");
-            Console.Out.Flush();
-        };
-        session.Closed += s =>
-        {
-            Console.WriteLine($"C#:CLOSED:{s.DeviceId}");
-            Console.Out.Flush();
-        };
-        manager.Register(session);
-        return Task.CompletedTask;
-    };
-
-    _ = server.StartAsync();
-    await WaitUntil(() => server.LocalPort >= 0);
-    Console.WriteLine($"C#:LISTENING:{server.LocalPort}");
-    Console.Out.Flush();
-
-    // Drive the server from stdin: any line other than STOP is ignored; EOF or
-    // STOP stops the listener and exits (the Dart integration tool sends STOP).
-    while (true)
-    {
-        var line = Console.ReadLine();
-        if (line == null || line.Trim() == "STOP")
-            break;
-    }
-
-    await server.StopAsync();
-    return 0;
-}
-
 static byte[] MakeFrame(byte type, byte[] payload, ushort sequence = 0,
     bool ackRequested = false, bool mustUnderstand = false, byte major = 1, ulong timestamp = 0)
     => FrameBuilder.Build(type, payload, sequence, ackRequested, mustUnderstand, major, 0, timestamp);
@@ -1794,7 +1802,7 @@ static bool FramesEqual(ProtocolFrame a, ProtocolFrame b) =>
     a.Timestamp == b.Timestamp &&
     a.Payload.SequenceEqual(b.Payload);
 
-static async Task WaitUntil(Func<bool> condition, int timeoutMs = 5000)
+public static async Task WaitUntil(Func<bool> condition, int timeoutMs = 5000)
 {
     var deadline = Environment.TickCount64 + timeoutMs;
     while (!condition())
@@ -1822,7 +1830,7 @@ static IAuthenticator DefaultTestAuthenticator(string deviceId = "ctrl-42a8")
 }
 
 // ---------------------------------------------------------------------------
-// M1.4.4 — real authentication (docs/protocol.md §12)
+// M1.4.4 ΓÇö real authentication (docs/protocol.md ┬º12)
 // ---------------------------------------------------------------------------
 
 static void RunHmacVectorSmokeTests()
@@ -1906,7 +1914,7 @@ static void RunRealAuthTokenLifecycleSmokeTests()
     var tokens = new InMemoryTokenStore();
     var auth = new HmacAuthenticator(AuthTestEnv.MasterKey, tokens, pairing);
 
-    // Pairing success stores a HASH of the token — never the raw bytes.
+    // Pairing success stores a HASH of the token ΓÇö never the raw bytes.
     var (sA, cA, lA, fA) = HandshakeToReady(authenticator: auth, pairing: true,
         credential: AuthTestEnv.PairingCode);
     var okA = AuthOkPayloadCodec.Decode(cA.SentFrames[^1].Payload);
@@ -2067,7 +2075,7 @@ static void RunLockoutSmokeTests()
 }
 
 // ---------------------------------------------------------------------------
-// M2.0 — input architecture (Session → IOutputSink boundary)
+// M2.0 ΓÇö input architecture (Session ΓåÆ IOutputSink boundary)
 // ---------------------------------------------------------------------------
 
 static void RunOutputSinkSmokeTests()
@@ -2194,7 +2202,7 @@ static void RunWin32MapperSmokeTests()
         "right control maps as an extended key-up");
 
     // Combination flow through the sink: LCONTROL down, C down, C up, LCONTROL
-    // up — held set tracks the chord, ReleaseAll clears the remainder.
+    // up ΓÇö held set tracks the chord, ReleaseAll clears the remainder.
     var sent = new List<Win32Output>();
     var chordSink = new Win32InputSink(actions => { sent.AddRange(actions); return actions.Count; });
     chordSink.HandleInput(Button("key:RCONTROL", InputEventCodec.StateDown, InputEventCodec.FlagStateChanged));
@@ -2223,8 +2231,9 @@ static void RunWin32MapperSmokeTests()
         == Win32OutputKind.None, "unknown key name maps to None");
 
     // Sink lifecycle over the injected send path: hold two keys, release one,
-    // then ReleaseAll frees exactly what remains — no real SendInput in tests.
+    // then ReleaseAll frees exactly what remains ΓÇö no real SendInput in tests.
     ushort? lastReleased = null;
+    _ = lastReleased;
     var sentActions = new List<Win32Output>();
     var sink = new Win32InputSink(actions =>
     {
@@ -2237,7 +2246,7 @@ static void RunWin32MapperSmokeTests()
         Button("key:66", InputEventCodec.StateDown, InputEventCodec.FlagInitial),
         Button("key:67", InputEventCodec.StateUp, InputEventCodec.FlagInitial),
     }));
-    // M2.3: INPUT_SNAPSHOT is authoritative (§15) — key 65 is not in the
+    // M2.3: INPUT_SNAPSHOT is authoritative (┬º15) ΓÇö key 65 is not in the
     // snapshot, so reconciliation releases it while pressing 66.
     Assert(sentActions.Any(a => a is { Kind: Win32OutputKind.KeyDown, VirtualKey: 66 }),
         "snapshot presses the listed key");
@@ -2259,7 +2268,7 @@ static void RunWin32MapperSmokeTests()
 }
 
 // ---------------------------------------------------------------------------
-// M2.2 — mouse input (buttons, relative motion loop, wheel)
+// M2.2 ΓÇö mouse input (buttons, relative motion loop, wheel)
 // ---------------------------------------------------------------------------
 
 static void RunMouseSinkSmokeTests()
@@ -2349,7 +2358,7 @@ static void RunMouseSinkSmokeTests()
     var countAfterRelease = motionSent.Count;
     motionSink.PumpTick();
     Assert(motionSent.Count == countAfterRelease,
-        "ReleaseAll clears motion velocity (§16)");
+        "ReleaseAll clears motion velocity (┬º16)");
 
     // --- Wheel accumulation ---------------------------------------------------
     var wheelSent = new List<Win32Output>();
@@ -2387,7 +2396,7 @@ static void RunMouseSinkSmokeTests()
 }
 
 // ---------------------------------------------------------------------------
-// M2.3 — input E2E / reliability
+// M2.3 ΓÇö input E2E / reliability
 // ---------------------------------------------------------------------------
 
 static async Task RunInputReliabilitySmokeTests()
@@ -2444,7 +2453,7 @@ static async Task RunInputReliabilitySmokeTests()
     Assert(iso.HeldKeys.Count == 0 && iso.HeldButtons.Count == 0,
         "repeated ReleaseAll stays neutral without invalid releases");
 
-    // --- Snapshot reconciliation (§15: snapshot is authoritative) -------------
+    // --- Snapshot reconciliation (┬º15: snapshot is authoritative) -------------
     var recon = new Win32InputSink(motionLoopEnabled: false);
     recon.HandleInput(KeyButton("key:A", InputEventCodec.StateDown));
     recon.HandleInput(MouseEvent("mouse:left", InputEventCodec.StateDown));
@@ -2584,7 +2593,7 @@ static async Task RunInputReliabilitySmokeTests()
 }
 
 // ---------------------------------------------------------------------------
-// M2.4 — gamepad input (abstract gamepad per CAP_GAMEPAD, §8/§9/§18)
+// M2.4 ΓÇö gamepad input (abstract gamepad per CAP_GAMEPAD, ┬º8/┬º9/┬º18)
 // ---------------------------------------------------------------------------
 
 static void RunGamepadInputSmokeTests()
@@ -2647,14 +2656,14 @@ static void RunGamepadInputSmokeTests()
         "gamepad:rstick", InputEventCodec.KindStick, 0, X: 2.0f, Y: -2.0f));
     var rstick = stickSink.GamepadAxes["gamepad:rstick"];
     Assert(rstick.Fx == 1f && rstick.Fy == -1f,
-        "right stick values outside -1..1 are clamped per §9");
+        "right stick values outside -1..1 are clamped per ┬º9");
 
     stickSink.HandleInput(new InputEvent(
         "gamepad:rstick", InputEventCodec.KindStick, 0, X: 0f, Y: 0f));
     Assert(stickSink.GamepadAxes["gamepad:rstick"] is { Fx: 0f, Fy: 0f },
         "neutral reset restores stick center");
 
-    // Non-finite stick input is dropped (§18 input-plane semantics).
+    // Non-finite stick input is dropped (┬º18 input-plane semantics).
     var beforeNan = stickSink.GamepadAxes.Count;
     stickSink.HandleInput(new InputEvent(
         "gamepad:lstick", InputEventCodec.KindStick, 0, X: float.NaN, Y: 0f));
@@ -2676,7 +2685,7 @@ static void RunGamepadInputSmokeTests()
     Assert(rtMax.Fx == 1f, "right trigger maximum maps to 1");
     var overClamp = Win32InputMapper.Map(new InputEvent(
         "gamepad:lt", InputEventCodec.KindTrigger, 0, Value: 5f));
-    Assert(overClamp.Fx == 1f, "out-of-range trigger clamps to 1 per §9 normalization");
+    Assert(overClamp.Fx == 1f, "out-of-range trigger clamps to 1 per ┬º9 normalization");
     stickSink.HandleInput(new InputEvent(
         "gamepad:rt", InputEventCodec.KindTrigger, 0, Value: 0.75f));
     Assert(Math.Abs(stickSink.GamepadAxes["gamepad:rt"].Fx - 0.75f) < 0.0001f,
@@ -2692,7 +2701,7 @@ static void RunGamepadInputSmokeTests()
     }
     Assert(Win32InputMapper.Map(new InputEvent(
         "gamepad:dpad", InputEventCodec.KindHat, 0, HatValue: 9)).Kind == Win32OutputKind.None,
-        "hat value 9 is invalid and dropped (§18)");
+        "hat value 9 is invalid and dropped (┬º18)");
 
     // --- Keyboard/mouse/gamepad isolation --------------------------------------
     var iso = new Win32InputSink(motionLoopEnabled: false);
@@ -2738,7 +2747,7 @@ static void RunGamepadInputSmokeTests()
 }
 
 // ---------------------------------------------------------------------------
-// M2.5 Phase A — gamepad output backend (IGamepadOutputBackend)
+// M2.5 Phase A ΓÇö gamepad output backend (IGamepadOutputBackend)
 // ---------------------------------------------------------------------------
 
 static void RunGamepadOutputBackendSmokeTests()
@@ -2843,6 +2852,7 @@ static InputEvent KeyButtonReliability(string id, byte state) =>
 
 static float lsticks_Fx((float Fx, float Fy) axis) => axis.Fx;
 static float lsticks_Fy((float Fx, float Fy) axis) => axis.Fy;
+}
 
 sealed class TestData
 {
@@ -2853,7 +2863,7 @@ sealed class TestData
 }
 
 /// <summary>
-/// M1.4.4 test environment for the real §12 authenticator: one pinned master
+/// M1.4.4 test environment for the real ┬º12 authenticator: one pinned master
 /// key shared by every suite (and mirrored by the Dart tests), helpers to build
 /// wire-correct AUTH payloads, and a pre-paired default authenticator so the
 /// M1.4.2/M1.4.3 suites keep exercising token reconnects.
@@ -3025,8 +3035,8 @@ sealed class IntegrationFlusher : IInputStateFlusher
 }
 
 /// <summary>M2.3: output sink for the integration server. Prints a RELEASED
-/// marker whenever the session's held input is flushed, proving the wire →
-/// decode → Session → IOutputSink cleanup path end-to-end.</summary>
+/// marker whenever the session's held input is flushed, proving the wire ΓåÆ
+/// decode ΓåÆ Session ΓåÆ IOutputSink cleanup path end-to-end.</summary>
 sealed class IntegrationOutputSink : CTRL.Desktop.Input.IOutputSink
 {
     private int _released;
