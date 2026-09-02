@@ -11,12 +11,19 @@ using CTRL.Desktop;
 using System.Windows;
 static class Program
 {
+    [STAThread]
     static void Main(string[] args)
     {
         if (args.Length >= 1 && args[0] == "--integration")
         {
             var port = args.Length >= 2 && int.TryParse(args[1], out var p) ? p : 0;
             RunIntegrationServerAsync(port).Wait();
+            return;
+        }
+        if (args.Length >= 1 && args[0] == "--smoke-tests")
+        {
+            DesktopSmokeTests.RunAll();
+            Console.WriteLine("SMOKE:ALL:PASS");
             return;
         }
 
@@ -189,7 +196,7 @@ static void RunPayloadPrimitiveSmokeTests()
     writer.WriteUInt64(0x0102030405060708UL);
     writer.WriteFloat32(0.5f);
     writer.WriteString("hi");
-    writer.WriteString("Γé¼");
+    writer.WriteString("€");
 
     var reader = new PayloadReader(writer.ToArray());
     if (reader.ReadUInt8() != 0xAB) throw new Exception("uint8 round-trip failed.");
@@ -198,11 +205,11 @@ static void RunPayloadPrimitiveSmokeTests()
     if (reader.ReadUInt64() != 0x0102030405060708UL) throw new Exception("uint64 round-trip failed.");
     if (reader.ReadFloat32() != 0.5f) throw new Exception("float32 round-trip failed.");
     if (reader.ReadString() != "hi") throw new Exception("string round-trip failed.");
-    if (reader.ReadString() != "Γé¼") throw new Exception("multi-byte string round-trip failed.");
+    if (reader.ReadString() != "€") throw new Exception("multi-byte string round-trip failed.");
     reader.ExpectEnd();
 
     var stringBytes = new PayloadWriter();
-    stringBytes.WriteString("Γé¼");
+    stringBytes.WriteString("€");
     var stringPayload = stringBytes.ToArray();
     if (stringPayload[0] != 3)
         throw new Exception("String prefix must be the UTF-8 byte length, not char count.");
@@ -247,7 +254,7 @@ static void RunHelloCodecSmokeTests()
     if (sixtyFourDecoded != sixtyFour)
         throw new Exception("HELLO 64-byte deviceId/clientVersion round-trip failed.");
 
-    var multiByte = new HelloPayload("├⌐", "c", 1, 0, 0x00000007);
+    var multiByte = new HelloPayload("é", "c", 1, 0, 0x00000007);
     var multiByteBytes = HelloPayloadCodec.Encode(multiByte);
     if (multiByteBytes[0] != 2)
         throw new Exception("HELLO deviceId length must be UTF-8 byte count.");
@@ -319,7 +326,7 @@ static void RunWelcomeCodecSmokeTests()
     if (sixtyFourNameDecoded.ServerName.Length != 64)
         throw new Exception("WELCOME 64-byte serverName round-trip failed.");
 
-    var multiByteName = new WelcomePayload("├⌐", 1, 0, 1, new byte[16], true, new byte[32]);
+    var multiByteName = new WelcomePayload("é", 1, 0, 1, new byte[16], true, new byte[32]);
     var multiByteNameBytes = WelcomePayloadCodec.Encode(multiByteName);
     if (multiByteNameBytes[0] != 2)
         throw new Exception("WELCOME serverName length must be UTF-8 byte count.");
@@ -393,7 +400,7 @@ static void RunAuthCodecSmokeTests()
     if (sixtyFourIdDecoded.DeviceId.Length != 64)
         throw new Exception("AUTH 64-byte deviceId round-trip failed.");
 
-    var multiByteId = new AuthPayload(0x02, "", "d├⌐", new byte[32]);
+    var multiByteId = new AuthPayload(0x02, "", "dé", new byte[32]);
     var multiByteIdBytes = AuthPayloadCodec.Encode(multiByteId);
     if (multiByteIdBytes[1] != 0x00 || multiByteIdBytes[2] != 3)
         throw new Exception("AUTH deviceId length must be UTF-8 byte count.");
@@ -519,7 +526,7 @@ static void RunAuthDeniedCodecSmokeTests()
     if (emptyDecoded.Message.Length != 0 || emptyDecoded.Reason != 0x02)
         throw new Exception("AUTH_DENIED empty message round-trip failed.");
 
-    var utf8Msg = AuthDeniedPayloadCodec.Encode(new AuthDeniedPayload(0x01, "├⌐chec"));
+    var utf8Msg = AuthDeniedPayloadCodec.Encode(new AuthDeniedPayload(0x01, "échec"));
     if (utf8Msg[1] != 6)
         throw new Exception("AUTH_DENIED message length must be the UTF-8 byte length.");
 
@@ -575,7 +582,7 @@ static void RunErrorCodecSmokeTests()
     if (emptyDecoded.Message.Length != 0)
         throw new Exception("ERROR empty message round-trip failed.");
 
-    var utf8Msg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, "├⌐chec"));
+    var utf8Msg = ErrorPayloadCodec.Encode(new ErrorPayload(0x01, 0x00, "échec"));
     if (utf8Msg[2] != 0x00 || utf8Msg[3] != 6)
         throw new Exception("ERROR messageLength must be uint16 BE UTF-8 byte length.");
 
@@ -788,7 +795,7 @@ static void RunInputEventCodecSmokeTests()
     }
 
     var utf8Id = new InputEvent(
-        "├⌐", InputEventCodec.KindButton, 0, State: InputEventCodec.StateUp, PressCount: 0);
+        "é", InputEventCodec.KindButton, 0, State: InputEventCodec.StateUp, PressCount: 0);
     var utf8Encoded = InputEventPayloadCodec.Encode(new InputEventPayload(utf8Id));
     if (utf8Encoded[0] != 2)
         throw new Exception("controlId length must be the UTF-8 byte length.");
